@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.1.3] - 2026-08-02
+
+### Bug Fixes
+- **infra:** Pin the state volume AZ to the subnet, not the instance (#3)
+
 ## [0.1.2] - 2026-08-02
 
 ### Bug Fixes
