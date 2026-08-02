@@ -22,14 +22,21 @@ echo "--- capsules come from S3, not from this disk ---"
 mountpoint /var/lib/dig-node/cache/modules
 echo "capsules visible: $(find /var/lib/dig-node/cache/modules -name '*.module' 2>/dev/null | wc -l)"
 
+# The gateway terminates TLS itself since #1951, so verify over HTTPS on the real port rather than
+# plain HTTP on 8080. Resolve the certificate's own name to loopback so the hostname VERIFIES —
+# curl -k would pass even with a broken or missing chain, which is exactly the failure this step
+# exists to catch on a deploy that just provisioned the cert.
+GW="https://${PEER_HOST:-node-rpc.dig.net}:${GATEWAY_PORT:-443}"
+CURL_RESOLVE=(--resolve "${PEER_HOST:-node-rpc.dig.net}:${GATEWAY_PORT:-443}:127.0.0.1")
+
 echo "--- the gateway answers ---"
-curl -fsS --max-time 5 localhost:8080/health
+curl -fsS "${CURL_RESOLVE[@]}" --max-time 5 "$GW/health"
 echo
 
 echo "--- an allowlisted method reaches the node ---"
 # Must NOT come back -32601: that would mean the gateway is refusing everything, which would make
 # the boundary check below pass for the wrong reason.
-ALLOWED="$(curl -fsS --max-time 20 localhost:8080 \
+ALLOWED="$(curl -fsS "${CURL_RESOLVE[@]}" --max-time 20 "$GW" \
   -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"dig.health"}')"
 echo "$ALLOWED"
@@ -37,7 +44,7 @@ echo "$ALLOWED" | grep -q -- '-32601' && { echo "FAIL: the gateway refused an al
 
 echo "--- a restricted method does not ---"
 for method in control.status cache.clear dig.listInventory sign; do
-  OUT="$(curl -fsS --max-time 10 localhost:8080 \
+  OUT="$(curl -fsS "${CURL_RESOLVE[@]}" --max-time 10 "$GW" \
     -H 'content-type: application/json' \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\"}")"
   echo "$OUT" | grep -q -- '-32601' || { echo "FAIL: $method was not refused: $OUT" >&2; exit 1; }
