@@ -7,9 +7,22 @@ data "aws_ssm_parameter" "al2023_arm64" {
   name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
 }
 
-# One deterministic subnet, so a re-apply does not migrate the instance between AZs.
+# Not every default-VPC subnet carries an IPv6 CIDR, and a peer node must have one: CLAUDE.md §5.2
+# makes IPv6 the preferred peer transport, and `RunInstances` fails outright with "Subnet does not
+# contain any IPv6 CIDR block ranges" if you ask for an IPv6 address in a v4-only subnet. So select
+# on the property rather than taking the first subnet and hoping.
+data "aws_subnet" "candidate" {
+  for_each = toset(data.aws_subnets.default.ids)
+  id       = each.value
+}
+
 locals {
-  subnet_id = sort(data.aws_subnets.default.ids)[0]
+  dualstack_subnet_ids = sort([
+    for s in data.aws_subnet.candidate : s.id if s.ipv6_cidr_block != ""
+  ])
+
+  # Deterministic, so a re-apply does not migrate the instance between AZs.
+  subnet_id = local.dualstack_subnet_ids[0]
 
   # Unbounded, expressed exactly: u64::MAX. dig-node reads DIG_NODE_CACHE_CAP into a u64 and
   # `plan_eviction` short-circuits when total <= cap, so this means "never evict"
@@ -18,6 +31,14 @@ locals {
   cache_cap_unbounded = "18446744073709551615"
 
   cache_root = "/var/lib/dig-node/cache"
+}
+
+# Fail the plan with a readable message rather than a RunInstances error part-way through an apply.
+check "dualstack_subnet_available" {
+  assert {
+    condition     = length(local.dualstack_subnet_ids) > 0
+    error_message = "No subnet in the default VPC has an IPv6 CIDR. A DIG peer must be dual-stack (CLAUDE.md §5.2); associate an IPv6 CIDR with the VPC and a subnet before applying."
+  }
 }
 
 resource "aws_instance" "node" {
