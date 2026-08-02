@@ -31,6 +31,29 @@ merge to main -> release.yml cuts vX.Y.Z -> deploy.yml:
 version is an operational decision, it is visible in the workflow run, and it can be rolled back
 without a code change.
 
+### The OIDC subject for this repo is NOT `repo:DIG-Network/rpc.dig.net`
+
+Worth knowing before you debug an `AssumeRoleWithWebIdentity` denial for an hour. GitHub now issues
+**immutable, ID-based subject prefixes to newly created repositories**, even when
+`use_default: true` and `use_immutable_subject: false`:
+
+```
+$ gh api repos/DIG-Network/rpc.dig.net/actions/oidc/customization/sub
+{"use_default":true,"use_immutable_subject":false,
+ "sub_claim_prefix":"repo:DIG-Network@180309536/rpc.dig.net@1319851013"}
+
+$ gh api repos/DIG-Network/hub.dig.net/actions/oidc/customization/sub      # older repo
+{"use_default":true,"use_immutable_subject":false,
+ "sub_claim_prefix":"repo:DIG-Network/hub.dig.net"}
+```
+
+So a trust policy copied from an older DIG repo will deny every assume. `rpc-dig-net-ci-deploy`
+trusts **both** forms, scoped in each case to `:environment:production`, `:ref:refs/heads/main`,
+and `:ref:refs/tags/*`.
+
+Never widen that to a bare `repo:…:*`. The `pull_request` subject matches it, which would let a
+workflow running on a **fork's** pull request assume the deploy role.
+
 ### Changing a setting safely
 
 Edit the `.tf` file, open a PR, let CI run `terraform validate`, merge. Never `aws ... modify` a
