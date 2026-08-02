@@ -112,8 +112,16 @@ resource "aws_eip" "node" {
 # along on the same volume so a deploy does not throw away warm state either.
 #
 # Capsules are NOT here. They are on the S3 mount; this volume is small on purpose.
+# The AZ comes from the SUBNET, not from `aws_instance.node.availability_zone`.
+#
+# That distinction is the whole reason this volume works. Every release changes the gateway
+# binary's SHA, which changes `user_data`, which replaces the instance — that is the intended
+# immutable-deploy behaviour. But reading the AZ off the instance makes it "known after apply" the
+# moment a replace is planned, which forces the VOLUME to be replaced too, which `prevent_destroy`
+# then blocks: a deploy that cannot proceed and a peer identity one `-target` away from being
+# deleted. Pinning to the subnet keeps the volume completely still while instances come and go.
 resource "aws_ebs_volume" "state" {
-  availability_zone = aws_instance.node.availability_zone
+  availability_zone = data.aws_subnet.candidate[local.subnet_id].availability_zone
   size              = 8
   type              = "gp3"
   encrypted         = true

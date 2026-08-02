@@ -54,6 +54,20 @@ and `:ref:refs/tags/*`.
 Never widen that to a bare `repo:…:*`. The `pull_request` subject matches it, which would let a
 workflow running on a **fork's** pull request assume the deploy role.
 
+### Every deploy replaces the instance — on purpose
+
+The gateway binary's SHA-256 is baked into `user_data`, so a new release changes `user_data`, which
+replaces the EC2 instance. Immutable infrastructure, with the cost you would expect: a few minutes
+of downtime while the new host boots, re-installs `dig-node`, and re-establishes the S3 mount.
+
+What must **not** be replaced is `aws_ebs_volume.state`, because it holds the node's peer identity.
+Its AZ is therefore read from the subnet, never from `aws_instance.node.availability_zone` — the
+latter goes "known after apply" whenever a replace is planned, which cascades into replacing the
+volume and trips its `prevent_destroy`. If you ever see *"Resource aws_ebs_volume.state has
+lifecycle.prevent_destroy set, but the plan calls for this resource to be destroyed"*, something has
+re-coupled the volume to the instance. Do not disable `prevent_destroy` to get past it — that guard
+is the peer identity's last line of defence. Break the coupling instead.
+
 ### Changing a setting safely
 
 Edit the `.tf` file, open a PR, let CI run `terraform validate`, merge. Never `aws ... modify` a
