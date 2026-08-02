@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "rpc-dig-net"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "axum",
  "http-body-util",

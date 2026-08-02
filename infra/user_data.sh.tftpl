@@ -22,6 +22,14 @@ REGION="${region}"
 dnf -y update
 dnf -y install fuse fuse-libs tar gzip
 
+# --- Stop sshd -------------------------------------------------------------------------------
+# Management is SSM Session Manager and there is no key pair, so sshd here is a listening service
+# with no legitimate caller. The security group already blocks 22, but "unreachable today" is a
+# property of one config file; "not running" is a property of the host. This box is deliberately
+# internet-facing on two peer ports, so the standard is that installing DIG does not expose the
+# machine — and every daemon that is not the DIG surface is removed from that surface.
+systemctl disable --now sshd 2>/dev/null || true
+
 # --- Mountpoint for Amazon S3 -------------------------------------------------------------
 curl -fsSL -o /tmp/mount-s3.rpm https://s3.amazonaws.com/mountpoint-s3-release/latest/arm64/mount-s3.rpm
 dnf -y install /tmp/mount-s3.rpm
