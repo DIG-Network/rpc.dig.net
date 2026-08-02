@@ -5,9 +5,18 @@ variable "region" {
 }
 
 variable "peer_host" {
-  description = "Public DNS name of the node itself — the address peers dial on the peer ports. Distinct from rpc.dig.net, which is the browser read tier in front of the gateway."
+  description = <<-EOT
+    Public DNS name of the node itself — the address peers dial on the peer ports. Distinct from
+    rpc.dig.net, which is the browser read tier in front of the gateway.
+
+    NOT `node.dig.net`. That name already exists in the zone, is owned by the standing P2P fleet
+    lane, and currently points at an address that is not the running fleet node — i.e. it is
+    contested AND stale. Taking it would put two writers on one DNS record, which is the exact
+    failure dig_ecosystem#1938 documents. `node-rpc.dig.net` is the name the committed
+    rpc-peer-endpoint design already reserved for this role.
+  EOT
   type        = string
-  default     = "node.dig.net"
+  default     = "node-rpc.dig.net"
 }
 
 variable "zone_name" {
