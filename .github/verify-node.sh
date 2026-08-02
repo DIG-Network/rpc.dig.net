@@ -54,10 +54,43 @@ fi
 echo "9778 is loopback-only"
 
 echo "--- peer ports are listening ---"
+# The peer network comes up AFTER the HTTP surface, not with it: dig-node dials the relay, runs
+# STUN reflexive discovery, joins the DHT, and only then binds 9444. Measured at ~36 s past the
+# gateway answering. Checking once, immediately after /health, fails on a node that is perfectly
+# healthy and merely still starting.
 for port in 9444 9445; do
-  ss -tlnH 2>/dev/null | awk '{print $4}' | grep -q ":$port$" \
-    || { echo "FAIL: nothing is listening on $port" >&2; exit 1; }
+  for _ in $(seq 1 30); do
+    ss -tlnH 2>/dev/null | awk '{print $4}' | grep -q ":$port\$" && break
+    sleep 5
+  done
+  ss -tlnH 2>/dev/null | awk '{print $4}' | grep -q ":$port\$" \
+    || { echo "FAIL: nothing is listening on $port after 150s" >&2;
+         journalctl -u dig-node -n 40 --no-pager >&2; exit 1; }
 done
 echo "9444 + 9445 listening"
+
+echo "--- this node is actually peered, not just listening ---"
+# A bound socket proves nothing about reachability. Require at least one established peer
+# connection, which is the difference between "a node" and "a node on the network".
+for _ in $(seq 1 24); do
+  PEERED="$(journalctl -u dig-node --no-pager 2>/dev/null | grep -c 'peer connection established' || true)"
+  [ "${PEERED:-0}" -gt 0 ] && break
+  sleep 5
+done
+[ "${PEERED:-0}" -gt 0 ] || { echo "FAIL: no peer connection was ever established" >&2; exit 1; }
+echo "peer connections established: $PEERED"
+
+echo "--- nothing else is listening on a routable address ---"
+# The whole point of the peer ports being open is that they are the ONLY thing open. Enumerate
+# every non-loopback listener and assert the set is exactly what this service intends.
+UNEXPECTED="$(ss -tlnH 2>/dev/null | awk '{print $4}' \
+  | grep -vE '^(127\.0\.0\.1|\[::1\]):' \
+  | grep -vE ':(9444|9445|8080)$' || true)"
+if [ -n "$UNEXPECTED" ]; then
+  echo "FAIL: unexpected listener(s) on a routable address:" >&2
+  echo "$UNEXPECTED" >&2
+  exit 1
+fi
+echo "routable listeners are exactly 9444, 9445, 8080"
 
 echo "VERIFIED"
