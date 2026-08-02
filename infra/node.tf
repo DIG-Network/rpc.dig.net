@@ -78,6 +78,7 @@ resource "aws_instance" "node" {
     dig_node_sha256  = var.dig_node_sha256
     gateway_url      = var.gateway_artifact_url
     gateway_sha256   = var.gateway_sha256
+    peer_host        = var.peer_host
   })
 
   tags = {

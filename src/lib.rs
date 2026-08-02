@@ -32,6 +32,10 @@ pub mod jsonrpc;
 pub mod server;
 pub mod tier;
 
+/// Origin TLS for the deployed gateway (#1951). Feature-gated with the rest of the server stack.
+#[cfg(feature = "server")]
+pub mod tls;
+
 pub use gate::{screen, Verdict};
 pub use tier::{tier_of, Tier, PUBLIC_READ_METHODS};
 
