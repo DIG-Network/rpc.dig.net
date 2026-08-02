@@ -40,7 +40,7 @@ resource "aws_security_group" "node" {
 
 resource "aws_vpc_security_group_ingress_rule" "peer_rpc_v6" {
   security_group_id = aws_security_group.node.id
-  description       = "9444 peer-RPC + DHT over mTLS (IPv6 — preferred per CLAUDE.md 5.2)."
+  description       = "9444 peer-RPC + DHT over mTLS (IPv6, preferred per CLAUDE.md 5.2)."
   cidr_ipv6         = "::/0"
   from_port         = 9444
   to_port           = 9444

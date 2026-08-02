@@ -93,8 +93,8 @@ ls /var/lib/dig-node/cache/modules             # the published capsules, served 
 | claim | how to prove it |
 |---|---|
 | the capsule store is S3, not disk | `df -h /var/lib/dig-node/cache/modules` shows the FUSE mount; `du -sh` on the EBS root does not grow when a capsule is served |
-| the node is a real peer | dial `node.dig.net:9444` from another node and complete an mTLS handshake |
-| `9778` is not exposed | `nmap -Pn -p 9778 node.dig.net` from off-host must not connect |
+| the node is a real peer | dial `node-rpc.dig.net:9444` from another node and complete an mTLS handshake |
+| `9778` is not exposed | `nmap -Pn -p 9778 node-rpc.dig.net` from off-host must not connect |
 | the read tier is CloudFront-only | the gateway port must refuse a direct connection from an arbitrary host |
 | a restricted method is unreachable | `POST` `control.status` through the public URL returns `-32601` |
 

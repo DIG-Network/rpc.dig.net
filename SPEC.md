@@ -34,7 +34,7 @@ or capsule storage. Every answer it returns for a content method MUST come from 
 | name | is | reachable |
 |---|---|---|
 | `rpc.dig.net` | the read tier | CloudFront → the gateway |
-| `node.dig.net` | the node itself | `9444`, `9445` — directly, from any peer |
+| `node-rpc.dig.net` | the node itself | `9444`, `9445` — directly, from any peer |
 
 They are separate names on purpose: one is a CDN-fronted read surface, the other is a peer address
 that goes in address books. Conflating them would put the read tier's edge in the peer dial path.

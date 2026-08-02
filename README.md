@@ -6,8 +6,8 @@ node, and not a simulation of one.
 ```
                     browsers                              peers
                        |                                    |
-              https://rpc.dig.net                  node.dig.net:9444 (peer-RPC + DHT, mTLS)
-                       |                           node.dig.net:9445 (gossip)
+              https://rpc.dig.net                  node-rpc.dig.net:9444 (peer-RPC + DHT, mTLS)
+                       |                           node-rpc.dig.net:9445 (gossip)
                   CloudFront                                |
                        |                                    |
         +--------------v------------------------------------v--------------+
