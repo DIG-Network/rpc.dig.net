@@ -17,17 +17,24 @@ required-features = ["server"]
 # The pure gate/tier logic builds with no features and no I/O — that is what the test suite
 # and any consumer needs. `server` adds the axum runtime for the deployed binary.
 default = []
-server = ["dep:axum", "dep:axum-server", "dep:rustls", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber"]
+server = ["dep:axum", "dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 axum = { version = "0.7", optional = true }
-# Origin TLS (#1951): axum::serve has no TLS, so the server half comes from axum-server with rustls
-# (ring, matching the rest of the ecosystem — never OpenSSL).
-axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
+# Origin TLS (#1951): axum::serve has no TLS, so the accept loop is hand-wired over tokio-rustls +
+# hyper-util rather than pulling axum-server, whose tls-rustls feature depends on `rustls-pemfile`
+# (unmaintained, RUSTSEC-2025-0134) — the same crate dig-relay's tls.rs deliberately avoids. PEM
+# parsing therefore uses rustls-pki-types' own PemObject trait, matching that decision.
+# rustls with ring only, never OpenSSL, matching the rest of the peer stack.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+rustls-pki-types = { version = "1", optional = true }
+hyper = { version = "1", features = ["server", "http1", "http2"], optional = true }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"], optional = true }
+tower-service = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 tower-http = { version = "0.6", features = ["cors", "limit", "timeout"], optional = true }
