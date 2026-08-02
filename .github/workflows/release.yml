@@ -11,6 +11,13 @@
 # Idempotent + loop-safe: no-op if the version's tag already exists; skips its own changelog commit.
 name: Release
 
+# NEVER create a tag whose name collides with a branch name (learned the hard way, #1951).
+# A stray `refs/tags/main` existed alongside `refs/heads/main`, which made this workflow's
+# `git push origin HEAD:main` fail with `dst refspec main matches more than one` — after it had
+# already committed the changelog and created the version tag locally. The release died half-done
+# and EVERY subsequent release would have died the same way until the tag was removed. If this
+# error ever reappears, look for a tag sharing a branch name before looking at the push itself.
+
 on:
   push:
     branches:
