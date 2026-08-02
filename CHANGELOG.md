@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.2.1] - 2026-08-02
+
+### Features
+- **origin:** Terminate TLS at the gateway so the cutover can use an https-only origin (#6)
+
+### Documentation
+- **release:** Record the branch/tag name collision that broke the release (#7)
+
 ## [0.1.5] - 2026-08-02
 
 ### Bug Fixes
