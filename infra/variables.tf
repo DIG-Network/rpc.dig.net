@@ -65,7 +65,7 @@ variable "enable_stun" {
 variable "gateway_port" {
   description = "Port the read-tier gateway listens on. Reachable ONLY from the CloudFront origin-facing prefix list, never the open internet."
   type        = number
-  default     = 8080
+  default     = 443
 }
 
 variable "dig_node_version" {

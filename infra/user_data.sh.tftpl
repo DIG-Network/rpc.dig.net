@@ -147,6 +147,64 @@ ReadWritePaths=$CACHE_ROOT /var/lib/dig-node
 WantedBy=multi-user.target
 UNIT
 
+# --- Origin TLS certificate (#1951) -------------------------------------------------------------
+# CloudFront reaches this box over the public internet, so the origin hop must not be plaintext.
+# Not for the payload's sake — DIG content is already ciphertext + merkle proofs — but because the
+# request path carries /stores/{store_id}/content/{retrieval_key}. In the clear that tells any
+# on-path observer which capsule each reader is fetching: a deanonymisation leak about READERS,
+# which provider-blindness exists to prevent.
+#
+# Let's Encrypt rather than the account's *.dig.net ACM wildcard, because that certificate is
+# AMAZON_ISSUED with Export DISABLED — its private key cannot be retrieved, so it is only usable by
+# an AWS service that terminates TLS (CloudFront/ALB/NLB). Using it would mean a load balancer at
+# ~$16/mo, roughly doubling this node's cost, against an explicit cheapest-configuration
+# requirement.
+#
+# KNOWN DEBT: renewal is a certbot timer on this box. If it silently fails the origin cert expires
+# and the read tier 502s 90 days later, far from whatever broke it. There is no expiry alarm yet —
+# accepted deliberately at this stage (#1951), and the exit is the NLB + wildcard.
+#
+# DNS-01, not HTTP-01: no extra port opens on a box already internet-facing on two peer ports, and
+# the account already runs Route53 for this zone.
+dnf install -y certbot python3-certbot-dns-route53
+
+CERT_DIR=/etc/letsencrypt/live/${peer_host}
+if ! certbot certonly --dns-route53 --non-interactive --agree-tos       --register-unsafely-without-email       -d "${peer_host}" --cert-name "${peer_host}"; then
+  echo "certbot failed — the gateway will start WITHOUT TLS and CloudFront (https-only) cannot reach it" >&2
+fi
+
+# The gateway runs unprivileged, so give it read access to the live cert without opening the whole
+# archive: the private keys of any OTHER cert on this host stay unreadable to it.
+groupadd -f certaccess
+usermod -aG certaccess dignode
+chgrp -R certaccess /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+chmod -R g+rX /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+
+# Renewal, plus a gateway restart so a renewed cert is actually SERVED — certbot rewriting the file
+# does nothing on its own, the process holds the old one until it reloads.
+cat >/etc/systemd/system/certbot-renew.service <<'UNIT'
+[Unit]
+Description=Renew the rpc.dig.net origin certificate
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/certbot renew --quiet --dns-route53
+ExecStartPost=/bin/systemctl try-restart rpc-gateway.service
+UNIT
+
+cat >/etc/systemd/system/certbot-renew.timer <<'UNIT'
+[Unit]
+Description=Twice-daily origin certificate renewal check
+
+[Timer]
+OnCalendar=*-*-* 03,15:00:00
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
 # --- The read-tier gateway --------------------------------------------------------------------
 # Talks to the node over loopback only. The node's 9778 is never published: besides content reads
 # it answers wallet RPC, a wallet WebSocket, and /s/* server-side-DECRYPTED plaintext.
@@ -162,6 +220,8 @@ User=dignode
 Group=dignode
 Environment=GATEWAY_LISTEN=0.0.0.0:${gateway_port}
 Environment=DIG_NODE_URL=http://127.0.0.1:9778
+Environment=GATEWAY_TLS_CERT=/etc/letsencrypt/live/${peer_host}/fullchain.pem
+Environment=GATEWAY_TLS_KEY=/etc/letsencrypt/live/${peer_host}/privkey.pem
 Environment=RUST_LOG=info
 ExecStart=/usr/local/bin/rpc-gateway
 Restart=always
@@ -172,6 +232,14 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 RestrictSUIDSGID=true
+# ProtectSystem=strict makes /etc read-only for this unit; the cert is READ, never written, so
+# read-only is exactly right — certbot renews it as root in its own unit.
+SupplementaryGroups=certaccess
+# The gateway now terminates TLS on 443, and a port below 1024 cannot be bound by an unprivileged
+# user. Grant JUST the bind capability rather than running as root: NoNewPrivileges above still
+# holds, and CAP_NET_BIND_SERVICE confers nothing else.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -180,4 +248,5 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now dig-capsules.service
 systemctl enable --now dig-node.service
+systemctl enable --now certbot-renew.timer
 systemctl enable --now rpc-gateway.service

@@ -1,6 +1,6 @@
 [package]
 name = "rpc-dig-net"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -17,13 +17,17 @@ required-features = ["server"]
 # The pure gate/tier logic builds with no features and no I/O — that is what the test suite
 # and any consumer needs. `server` adds the axum runtime for the deployed binary.
 default = []
-server = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber"]
+server = ["dep:axum", "dep:axum-server", "dep:rustls", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 axum = { version = "0.7", optional = true }
+# Origin TLS (#1951): axum::serve has no TLS, so the server half comes from axum-server with rustls
+# (ring, matching the rest of the ecosystem — never OpenSSL).
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 tower-http = { version = "0.6", features = ["cors", "limit", "timeout"], optional = true }

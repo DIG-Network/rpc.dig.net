@@ -29,9 +29,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gateway = Gateway::new(node_url)?;
     tracing::info!(%listen, node = %gateway.node_url(), version = VERSION, "rpc.dig.net gateway up");
 
-    let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(listener, router(gateway))
-        .with_graceful_shutdown(shutdown_signal())
+    // TLS is served HERE, at the origin, when a cert pair is configured (#1951).
+    //
+    // CloudFront reaches this box over the public internet, so the hop must not be plaintext — not
+    // because the payload needs it (DIG content is already ciphertext + merkle proofs) but because
+    // the REQUEST PATH carries `/stores/{store_id}/content/{retrieval_key}`. In the clear that tells
+    // any on-path observer exactly which capsule each reader is fetching: a deanonymisation leak
+    // about readers, even though the content stays confidential. Provider-blindness is the read
+    // tier's whole posture and a plaintext origin hop re-opens it.
+    //
+    // Unset (both empty) keeps plain HTTP, which is what the local tests and a dev run use.
+    let cert = std::env::var("GATEWAY_TLS_CERT").unwrap_or_default();
+    let key = std::env::var("GATEWAY_TLS_KEY").unwrap_or_default();
+
+    if cert.is_empty() || key.is_empty() {
+        tracing::warn!("no GATEWAY_TLS_CERT/KEY — serving plain HTTP (dev only)");
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        axum::serve(listener, router(gateway))
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+        return Ok(());
+    }
+
+    // rustls 0.23 refuses to auto-pick a provider when more than one could be linked, so install
+    // ring explicitly before any TLS use — otherwise this panics at first connection rather than
+    // failing at startup, which is the worse failure to debug on a live origin.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| "could not install the rustls ring provider")?;
+
+    let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await?;
+    tracing::info!(cert = %cert, "origin TLS enabled");
+    axum_server::bind_rustls(listen, tls)
+        .serve(router(gateway).into_make_service())
         .await?;
     Ok(())
 }
