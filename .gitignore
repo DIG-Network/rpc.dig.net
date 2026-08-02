@@ -1,0 +1,15 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Terraform (the provider lock file .terraform.lock.hcl IS committed for reproducible CI)
+infra/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfplan
+
+# Local env / secrets
+.env
+.env.local
+*.pem

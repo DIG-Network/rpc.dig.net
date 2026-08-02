@@ -1,0 +1,44 @@
+[package]
+name = "rpc-dig-net"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+description = "rpc.dig.net — the public DIG Network read gateway: a strict allowlist wrapper in front of a real public dig-node."
+repository = "https://github.com/DIG-Network/rpc.dig.net"
+publish = false
+
+[[bin]]
+name = "gateway"
+path = "src/bin/gateway.rs"
+required-features = ["server"]
+
+[features]
+# The pure gate/tier logic builds with no features and no I/O — that is what the test suite
+# and any consumer needs. `server` adds the axum runtime for the deployed binary.
+default = []
+server = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:tower-http", "dep:tracing", "dep:tracing-subscriber"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+axum = { version = "0.7", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+tower-http = { version = "0.6", features = ["cors", "limit", "timeout"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+# Drive the router as a tower Service so the HTTP boundary itself is under test, not just the
+# pure gate function.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

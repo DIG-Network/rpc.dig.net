@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# Node host bootstrap for rpc.dig.net.
+#
+# The one idea worth reading before the code: the node's cache directory is SPLIT. Capsules come
+# from S3 through a read-only Mountpoint mount; everything else in the cache tree stays on local
+# EBS. That split is not a preference, it is forced by what dig-node actually does to those paths —
+# `downloads/` uses O_RDWR + seek + arbitrary-order writes (dig-download sink.rs:154-176), which no
+# S3 mount supports, while capsule reads are whole-file with no seek (dig-node-core lib.rs:1004),
+# which Mountpoint serves perfectly.
+#
+# There is also a trap here that would have failed silently: dig-node write-probes its cache ROOT
+# on every path resolution (lib.rs:416-430) and, if the probe fails, quietly relocates the whole
+# cache to $TMPDIR instead of erroring. The root therefore MUST be writable local disk. Only the
+# `modules/` subdirectory is the mount.
+set -euxo pipefail
+
+CACHE_ROOT="${cache_root}"
+CAPSULE_DIR="$CACHE_ROOT/modules"
+BUCKET="${capsule_bucket}"
+REGION="${region}"
+
+dnf -y update
+dnf -y install fuse fuse-libs tar gzip
+
+# --- Mountpoint for Amazon S3 -------------------------------------------------------------
+curl -fsSL -o /tmp/mount-s3.rpm https://s3.amazonaws.com/mountpoint-s3-release/latest/arm64/mount-s3.rpm
+dnf -y install /tmp/mount-s3.rpm
+rm -f /tmp/mount-s3.rpm
+
+# --- Persistent state volume -----------------------------------------------------------------
+# Holds /var/lib/dig-node, which contains the node's peer identity keypair. It must survive an
+# instance replacement or peer_id changes on every deploy and the node arrives as a stranger.
+#
+# The volume attaches after this script starts, so wait for it. Format only if it is blank — a
+# reattached volume already carries the identity and reformatting would destroy it.
+wait_for_state_device() {
+  local dev
+  for _ in $(seq 1 60); do
+    dev="$(lsblk -dpno NAME,TYPE | awk '$2=="disk"{print $1}' | while read -r d; do
+      [ "$(lsblk -no MOUNTPOINT "$d" | tr -d ' \n')" = "" ] && lsblk -no NAME "$d" >/dev/null && echo "$d"
+    done | grep -v "$(findmnt -no SOURCE / | sed 's/p\?[0-9]*$//')" | head -1)"
+    [ -n "$dev" ] && { echo "$dev"; return 0; }
+    sleep 5
+  done
+  return 1
+}
+
+STATE_DEV="$(wait_for_state_device)"
+blkid "$STATE_DEV" >/dev/null 2>&1 || mkfs -t xfs "$STATE_DEV"
+mkdir -p /var/lib/dig-node
+grep -q "$STATE_DEV" /etc/fstab || echo "$STATE_DEV /var/lib/dig-node xfs defaults,nofail 0 2" >>/etc/fstab
+mount -a
+
+# --- Service account ----------------------------------------------------------------------
+# The node is internet-facing on two peer ports; it does not run as root.
+id -u dignode >/dev/null 2>&1 || useradd --system --home-dir /var/lib/dig-node --shell /sbin/nologin dignode
+
+mkdir -p "$CAPSULE_DIR" "$CACHE_ROOT/downloads" "$CACHE_ROOT/responses" "$CACHE_ROOT/peer-net"
+chown -R dignode:dignode /var/lib/dig-node
+
+# mount-s3 runs as root; dignode reads through the mount, so FUSE must allow a non-owner.
+grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' >>/etc/fuse.conf
+
+# --- Binaries, checksum-verified ------------------------------------------------------------
+install_verified() {
+  local url="$1" sha="$2" dest="$3" tmp
+  tmp="$(mktemp)"
+  curl -fsSL -o "$tmp" "$url"
+  echo "$sha  $tmp" | sha256sum -c -
+  install -m 0755 -o root -g root "$tmp" "$dest"
+  rm -f "$tmp"
+}
+
+install_verified "${dig_node_url}" "${dig_node_sha256}" /usr/local/bin/dig-node
+install_verified "${gateway_url}" "${gateway_sha256}" /usr/local/bin/rpc-gateway
+echo "${dig_node_version}" >/var/lib/dig-node/DIG_NODE_VERSION
+
+# --- The capsule mount ----------------------------------------------------------------------
+# --read-only is the security property, not a convenience: the node cannot write to its own
+# capsule store, so "no maximum cache capacity" can never become unbounded local growth. Only the
+# hub's publish path writes this bucket.
+#
+# No --cache flag on purpose. A local disk cache would put .dig bytes back on the instance, which
+# is the thing the deployment exists to avoid; dig-node already keeps a 256 MiB in-process decoded
+# LRU (lib.rs:1055-1078), so repeat window reads of a warm capsule do no I/O at all.
+cat >/etc/systemd/system/dig-capsules.service <<UNIT
+[Unit]
+Description=rpc.dig.net capsule store (Mountpoint for S3, read-only)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mount-s3 $BUCKET $CAPSULE_DIR \
+  --foreground --read-only --allow-other \
+  --region $REGION --dir-mode 0555 --file-mode 0444
+ExecStartPost=/bin/bash -c 'for i in {1..60}; do mountpoint -q $CAPSULE_DIR && exit 0; sleep 1; done; exit 1'
+ExecStop=/bin/fusermount -u $CAPSULE_DIR
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# --- The node ---------------------------------------------------------------------------------
+# Requires= (not just After=) so the node never starts against an empty directory where the mount
+# should be — that would look like "zero capsules held" rather than a failure.
+cat >/etc/systemd/system/dig-node.service <<UNIT
+[Unit]
+Description=DIG node (public peer behind rpc.dig.net)
+Requires=dig-capsules.service
+After=dig-capsules.service network-online.target
+
+[Service]
+Type=simple
+User=dignode
+Group=dignode
+Environment=DIG_NODE_CACHE=$CACHE_ROOT
+Environment=DIG_NODE_CACHE_CAP=${cache_cap}
+Environment=DIG_NODE_HOST=127.0.0.1
+Environment=DIG_NODE_PORT=9778
+ExecStart=/usr/local/bin/dig-node run
+Restart=always
+RestartSec=10
+
+# The node reaches the network and its cache, and nothing else on this host.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=$CACHE_ROOT /var/lib/dig-node
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# --- The read-tier gateway --------------------------------------------------------------------
+# Talks to the node over loopback only. The node's 9778 is never published: besides content reads
+# it answers wallet RPC, a wallet WebSocket, and /s/* server-side-DECRYPTED plaintext.
+cat >/etc/systemd/system/rpc-gateway.service <<UNIT
+[Unit]
+Description=rpc.dig.net public read-tier gateway
+Requires=dig-node.service
+After=dig-node.service
+
+[Service]
+Type=simple
+User=dignode
+Group=dignode
+Environment=GATEWAY_LISTEN=0.0.0.0:${gateway_port}
+Environment=DIG_NODE_URL=http://127.0.0.1:9778
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/rpc-gateway
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now dig-capsules.service
+systemctl enable --now dig-node.service
+systemctl enable --now rpc-gateway.service

@@ -1,0 +1,119 @@
+# Deploy on tag. Builds the gateway for aarch64, publishes it as a release asset, then applies
+# terraform with that asset's URL + SHA-256 pinned in.
+#
+# The host verifies the checksum before installing (infra/user_data.sh.tftpl). That is not
+# ceremony: this box is internet-facing on two peer ports, so "curl a binary and run it" is not an
+# acceptable install path.
+#
+# ONE WRITER. This workflow is the only thing that applies this stack — see dig_ecosystem#1938,
+# where two pipelines deploying one service silently undid each other for twelve minor versions.
+# Nothing else may touch these resources, and no setting may be changed in the console.
+#
+# Third-party actions are pinned to a full commit SHA (a mutable tag could be re-pointed).
+
+name: deploy
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # publish the release asset
+  id-token: write # OIDC into the deploy role
+
+concurrency:
+  group: deploy-rpc-dig-net
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: build + apply
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
+      # The node host is Graviton (arm64); cross-link with the aarch64 GNU toolchain.
+      - name: install cross linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: build gateway (aarch64)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --features server --bin gateway --target aarch64-unknown-linux-gnu
+
+      - name: checksum
+        id: art
+        run: |
+          set -euo pipefail
+          BIN=target/aarch64-unknown-linux-gnu/release/gateway
+          SHA="$(sha256sum "$BIN" | cut -d' ' -f1)"
+          echo "sha=$SHA" >>"$GITHUB_OUTPUT"
+          echo "bin=$BIN"  >>"$GITHUB_OUTPUT"
+          echo "gateway sha256=$SHA"
+
+      - name: publish the binary as a release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
+          gh release upload "$TAG" "${{ steps.art.outputs.bin }}#rpc-gateway-aarch64" --clobber
+
+      - uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: ${{ vars.CI_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+
+      - name: terraform init
+        run: |
+          terraform -chdir=infra init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=rpc.dig.net/terraform.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}"
+
+      - name: terraform apply
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          GATEWAY_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/rpc-gateway-aarch64"
+          terraform -chdir=infra apply -auto-approve -input=false \
+            -var="gateway_artifact_url=$GATEWAY_URL" \
+            -var="gateway_sha256=${{ steps.art.outputs.sha }}" \
+            -var="dig_node_version=${{ vars.DIG_NODE_VERSION }}" \
+            -var="dig_node_artifact_url=${{ vars.DIG_NODE_ARTIFACT_URL }}" \
+            -var="dig_node_sha256=${{ vars.DIG_NODE_SHA256 }}"
+
+      # Prove it, do not assume it. A green apply is not a serving node.
+      - name: verify the node answers
+        run: |
+          set -euo pipefail
+          HOST="$(terraform -chdir=infra output -raw peer_host)"
+          ORIGIN="$(terraform -chdir=infra output -raw gateway_origin)"
+          echo "peer host: $HOST"
+          echo "gateway origin: $ORIGIN"
+          for i in $(seq 1 40); do
+            if curl -fsS --max-time 5 "http://$ORIGIN/health" >/dev/null 2>&1; then
+              echo "gateway healthy after $((i*15))s"
+              curl -fsS "http://$ORIGIN/health"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "gateway did not become healthy" >&2
+          exit 1

@@ -1,0 +1,7 @@
+# cargo-nextest config (#489 flaky-test management).
+#
+# Retry a failing test up to 2 times before the run reports it as failed — this surfaces genuine
+# flakes (intermittent env/timing issues) without masking real regressions: a test that fails on
+# every retry still fails the job.
+[profile.default]
+retries = 2

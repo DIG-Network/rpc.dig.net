@@ -1,0 +1,49 @@
+# cargo-deny configuration (supply chain). Gates advisories, licenses, sources, and bans in CI.
+# This service's dependency tree is small: serde, serde_json, tokio, lambda_http, and the AWS SDK
+# (aws-config + aws-sdk-dynamodb) for the Lambda binary only.
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # rustls-webpki (name-constraints + CRL) — pulled ONLY by aws-smithy-http-client's
+    # `legacy-rustls` (rustls 0.21) for AWS-API TLS. These bugs require an attacker-controlled cert
+    # chain with crafted name constraints / malformed CRLs, whereas this service's aws-smithy client
+    # only connects to trusted AWS endpoints (DynamoDB GetItem). Tracked for an aws-sdk bump that
+    # moves aws-smithy off legacy-rustls to rustls 0.23.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    # ANSI-escape log poisoning in tracing-subscriber's fmt path. The resolver logs only its own
+    # WARN-level structured records to CloudWatch (no untrusted terminal sink), so the escape-poison
+    # vector does not apply. Tracked for a tracing-subscriber bump.
+    "RUSTSEC-2025-0055",
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",             # public-domain dedication (GPL-compatible); transitive crypto deps
+    "CDLA-Permissive-2.0", # permissive data license of the webpki-roots CA bundle
+    "GPL-2.0-only",        # this project's own license
+    "GPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
