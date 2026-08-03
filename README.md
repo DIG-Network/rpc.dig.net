@@ -22,7 +22,7 @@ node, and not a simulation of one.
         +-------------------------------------------------------------------+
                                            |
                                   s3://dig-rpc-node-capsules
-                                  {store_hex}/{root_hex}.module
+                                  {store_hex}/{root_hex}.dig
                                   written only by the hub's publish path
 ```
 

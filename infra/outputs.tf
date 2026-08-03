@@ -39,5 +39,5 @@ output "capsule_bucket" {
 
 output "capsule_key_layout" {
   description = "Key layout the publish path must write, matching dig-node's module_path."
-  value       = "{store_hex}/{root_hex}.module"
+  value       = "{store_hex}/{root_hex}.dig"
 }
