@@ -77,6 +77,11 @@ readonly RENEW_WITHIN_DAYS=30
 # so this is roughly seven times the real size.
 readonly MAX_ENCODED_BYTES=60000
 
+# What that payload is allowed to become. 64 KB of gzip can expand to something far larger, and
+# restore unpacks into /etc before anything has judged the contents; this bounds the damage a
+# deliberately compressible payload can do to the root filesystem. Real state is ~50 KB.
+readonly MAX_DECOMPRESSED_BYTES=$((8 * 1024 * 1024))
+
 # How a restore attempt ended. Three outcomes and not two, because ABSENT and FAILED demand
 # OPPOSITE responses: one may lead to an order, the other must never.
 readonly RESTORE_OK=0
@@ -162,9 +167,12 @@ apply_gateway_access() {
   # Only the directories that exist: certbot creates `archive/` when it writes its first
   # certificate, so on a host that has only ever restored, or during a first issue, it may not be
   # there yet. Naming a missing path here would abort the whole bootstrap over nothing.
+  # `! -L` is the load-bearing half. `chmod -R` ignores symlinks it meets during traversal but
+  # FOLLOWS one named on the command line, so a restored `archive -> /` would have had root run
+  # `chmod -R g+rX /` across the whole host. `-d` alone does not catch it: it follows the link too.
   local dir
   for dir in "$STATE_DIR/live" "$STATE_DIR/archive"; do
-    [ -d "$dir" ] || continue
+    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
     chgrp -h -R "$CERT_GROUP" "$dir"
     chmod -R g+rX "$dir"
   done
@@ -227,7 +235,7 @@ archive_names_are_permitted() {
       return 1
       ;;
     esac
-  done < <(tar -tzf "$WORK/state.tar.gz")
+  done < <(tar -tf "$WORK/state.tar")
 }
 
 # Nothing in the unpacked tree escapes it, and nothing in it can escalate.
@@ -251,7 +259,11 @@ staged_tree_is_contained() {
   fi
 
   while IFS= read -r link; do
-    target="$(realpath -m --relative-to="$STAGING" "$(dirname "$link")/$(readlink "$link")")"
+    # Resolve the LINK, never `dirname + readlink`. Reconstructing the path that way turns an
+    # absolute target into `$STAGING/live//etc/shadow`, and realpath then collapses the double
+    # slash to something inside the tree — so `-> /etc/shadow` was read as `live/etc/shadow` and
+    # accepted, while the far more exotic `-> ../../../etc/shadow` was correctly rejected.
+    target="$(realpath -m --relative-to="$STAGING" "$link")"
     case "$target" in
     /* | .. | ../*)
       log "the stored archive has a symlink pointing outside the state directory: $link"
@@ -261,15 +273,95 @@ staged_tree_is_contained() {
   done < <(find "$STAGING" -type l)
 }
 
-# certbot executes any `*_hook` recorded in a renewal config, as root, on every renewal. Those
-# lines are not part of a certificate, so strip them: a poisoned archive must not be able to
-# smuggle a command into the renewal path. `--no-directory-hooks` closes the other half.
-strip_renewal_hooks() {
-  local conf
-  for conf in "$STAGING"/renewal/*.conf; do
-    [ -e "$conf" ] || continue
-    sed -i -E '/^[[:space:]]*[a-z_]*hook[[:space:]]*=/d' "$conf"
-  done
+# Reduce every restored renewal config to keys we recognise, using certbot's OWN parser.
+#
+# certbot runs any hook named in a renewal config as root — `pre_hook` fires before the ACME
+# exchange even happens, and the timer re-runs it twice a day — so a poisoned archive must not be
+# able to carry one. Two decisions here, both learned the hard way:
+#
+# PARSE, DO NOT PATTERN-MATCH. The obvious version of this is a regex that deletes `*_hook =`
+# lines. It does not work, because certbot reads these files with configobj, whose grammar accepts
+# a QUOTED key and unquotes it: `'pre_hook' = …` is a bare `pre_hook` to certbot and invisible to
+# the regex. Any text-level filter can disagree with the real parser about what a key even is, so
+# this uses the real parser — the same configobj certbot imports — and the question stops being
+# "does this line look like a hook".
+#
+# ALLOWLIST, DO NOT DENYLIST. Removing the hook keys we know about only bans the variants someone
+# thought of. Everything outside the recognised set is dropped instead, so a hook key added by a
+# future certbot, spelled unusually, or hidden in a nested section is gone without anyone having to
+# predict it. Dropping is deliberate over rejecting: an unknown key cannot execute anything once it
+# is gone, whereas refusing the payload would strand a replacement with no certificate.
+#
+# Fails CLOSED. If the parser is unavailable or a config will not parse, the payload is refused
+# rather than installed unexamined.
+sanitize_renewal_configs() {
+  python3 - "$STAGING/renewal" <<'PYTHON' || return 1
+import os
+import re
+import shutil
+import sys
+
+try:
+    from configobj import ConfigObj
+except ImportError:
+    print("configobj is unavailable, so a renewal config cannot be examined", file=sys.stderr)
+    raise SystemExit(1)
+
+renewal_dir = sys.argv[1]
+if not os.path.isdir(renewal_dir):
+    raise SystemExit(0)
+
+# Everything certbot writes for this deployment. A key outside these sets is not something the
+# renewal needs, and dropping it is always safe.
+TOP_LEVEL = {"version", "archive_dir", "cert", "privkey", "chain", "fullchain"}
+RENEWAL_PARAMS = {
+    "account", "authenticator", "installer", "server", "key_type", "elliptic_curve",
+    "rsa_key_size", "must_staple", "reuse_key", "dns_route53_propagation_seconds",
+}
+CONFIG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.conf$")
+
+dropped = []
+
+for name in sorted(os.listdir(renewal_dir)):
+    path = os.path.join(renewal_dir, name)
+
+    # A name certbot would never read is a name that exists to hide something. Note certbot's own
+    # glob skips dot-files, so `.evil.conf` would sit on disk unexamined by any name-based filter.
+    if os.path.islink(path) or not os.path.isfile(path) or not CONFIG_NAME.match(name):
+        shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else os.remove(path)
+        dropped.append("file %s" % name)
+        continue
+
+    try:
+        config = ConfigObj(path, file_error=True)
+    except Exception as exc:
+        print("renewal config %s does not parse: %s" % (name, exc), file=sys.stderr)
+        raise SystemExit(1)
+
+    for key in list(config.scalars):
+        if key not in TOP_LEVEL:
+            del config[key]
+            dropped.append("%s: %s" % (name, key))
+
+    for section in list(config.sections):
+        if section != "renewalparams":
+            del config[section]
+            dropped.append("%s: [%s]" % (name, section))
+            continue
+        params = config[section]
+        for key in list(params.scalars):
+            if key not in RENEWAL_PARAMS:
+                del params[key]
+                dropped.append("%s: [renewalparams] %s" % (name, key))
+        for nested in list(params.sections):
+            del params[nested]
+            dropped.append("%s: [renewalparams][%s]" % (name, nested))
+
+    config.write()
+
+for item in dropped:
+    print(item)
+PYTHON
 }
 
 # Swap the staged directory into place.
@@ -319,6 +411,16 @@ restore() {
     log "the stored certificate is not valid base64"
     return "$RESTORE_ABSENT"
   fi
+
+  # Decompress ONCE, under a hard ceiling, before anything reads the contents. Reading one byte
+  # past the ceiling is how an overflow is detected; a payload that hits it is refused rather than
+  # unpacked into /etc. Everything downstream works from this plain tar.
+  gzip -dc "$WORK/state.tar.gz" 2>/dev/null |
+    head -c "$((MAX_DECOMPRESSED_BYTES + 1))" >"$WORK/state.tar" || true
+  if [ "$(wc -c <"$WORK/state.tar")" -gt "$MAX_DECOMPRESSED_BYTES" ]; then
+    log "the stored certificate expands past the $MAX_DECOMPRESSED_BYTES byte ceiling"
+    return "$RESTORE_ABSENT"
+  fi
   if ! archive_names_are_permitted; then
     return "$RESTORE_ABSENT"
   fi
@@ -327,7 +429,7 @@ restore() {
   rm -rf "$STAGING"
   mkdir -p "$STAGING"
   chmod 700 "$STAGING"
-  if ! tar -xzf "$WORK/state.tar.gz" -C "$STAGING" \
+  if ! tar -xf "$WORK/state.tar" -C "$STAGING" \
     --no-same-owner --no-same-permissions --no-xattrs --no-acls 2>/dev/null; then
     log "the stored certificate is not a readable gzipped tar"
     return "$RESTORE_ABSENT"
@@ -340,7 +442,16 @@ restore() {
     return "$RESTORE_ABSENT"
   fi
 
-  strip_renewal_hooks
+  local dropped
+  if ! dropped="$(sanitize_renewal_configs)"; then
+    log "the stored archive holds a renewal config that cannot be examined"
+    return "$RESTORE_ABSENT"
+  fi
+  if [ -n "$dropped" ]; then
+    log "dropped unrecognised renewal-config entries: $(echo "$dropped" | tr '
+' ';')"
+  fi
+
   chown -R "$STATE_OWNER" "$STAGING"
   find "$STAGING" -type d -exec chmod 700 {} +
   find "$STAGING" -type f -exec chmod 600 {} +

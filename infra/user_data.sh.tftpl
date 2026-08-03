@@ -176,8 +176,8 @@ dnf install -y certbot python3-certbot-dns-route53
 # secret — these are identifiers, and the file is world-readable on purpose.
 #
 # The heredoc is QUOTED: terraform substitutes these four values before the shell ever sees them,
-# so the shell has no reason to expand anything, and an unquoted heredoc would make a `$(…)` in any
-# operator-set variable execute as root at boot.
+# so the shell has no reason to expand anything on the way in. Writing the file is only half of it
+# — see how it is read back below, which is where the expansion would actually have happened.
 cat >/etc/dig-origin-cert.env <<'ENVFILE'
 DIG_ORIGIN_CERT_SECRET=${origin_cert_secret}
 DIG_ORIGIN_CERT_HOST=${peer_host}
@@ -272,10 +272,14 @@ UNIT
 # Runs AFTER every unit file exists, because a renewal triggered here restarts the gateway and
 # `systemctl try-restart` needs the unit to be known. Restores from Secrets Manager if it can;
 # orders from Let's Encrypt only if it cannot.
-set -a
-# shellcheck disable=SC1091
-. /etc/dig-origin-cert.env
-set +a
+# Read as key=value pairs, NOT sourced. `. file` runs the file as a shell script, so a `$(…)` in
+# any of those values would execute here as root — and systemd's own `EnvironmentFile=`, which the
+# renewal timer uses, does not do that. Quoting the heredoc above stops nothing on this path; this
+# does. The values are operator-set tfvars rather than attacker input, so this is closing the
+# mechanism rather than a live hole.
+while IFS='=' read -r key value; do
+  case "$key" in DIG_ORIGIN_CERT_* | AWS_DEFAULT_REGION) export "$key=$value" ;; esac
+done </etc/dig-origin-cert.env
 /usr/local/sbin/dig-origin-cert ensure
 
 # The certaccess group and the gateway's read access are applied by the helper itself, on every

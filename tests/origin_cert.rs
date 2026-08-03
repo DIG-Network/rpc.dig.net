@@ -684,6 +684,120 @@ cp "$live/cert.pem" "$live/fullchain.pem"
         );
     }
 
+    /// **A QUOTED hook key is still a hook key.**
+    ///
+    /// certbot parses these files with configobj, whose grammar accepts a quoted key and unquotes
+    /// it — so `'pre_hook' = …` is an ordinary `pre_hook` to certbot while looking like nothing at
+    /// all to a `^[a-z_]*hook` pattern. A text-level filter and the real parser disagreeing about
+    /// what counts as a key is the whole bug, and `pre_hook` in particular fires *before* the ACME
+    /// exchange, so the attacker does not even need the renewal to succeed.
+    #[test]
+    fn hook_keys_are_stripped_however_they_are_quoted() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_stored_archive_smuggling(&[(
+            &format!("renewal/{HOST}.conf"),
+            "version = 2.6.0\n\
+             archive_dir = /etc/letsencrypt/archive/x\n\
+             'pre_hook' = touch /tmp/pwned-pre\n\
+             \"post_hook\" = touch /tmp/pwned-post\n\
+             renew_hook = touch /tmp/pwned-renew\n\
+             [renewalparams]\n\
+             account = deadbeef\n\
+             'deploy_hook' = touch /tmp/pwned-deploy\n",
+        )]);
+
+        sandbox.run("restore").expect_success();
+
+        let installed = fs::read_to_string(
+            sandbox
+                .state_dir()
+                .join("renewal")
+                .join(format!("{HOST}.conf")),
+        )
+        .expect("the renewal config should have been restored");
+        assert!(
+            !installed.to_lowercase().contains("hook"),
+            "a hook survived into the installed renewal config:\n{installed}"
+        );
+        assert!(
+            installed.contains("archive_dir") && installed.contains("account"),
+            "stripping hooks must not gut the keys certbot needs:\n{installed}"
+        );
+    }
+
+    /// A renewal config certbot would read but a shell glob would not.
+    ///
+    /// `"$STAGING"/renewal/*.conf` does not match a leading dot, so a dot-prefixed config would sit
+    /// on disk unexamined by any name-based filter. Whether certbot reads it today is beside the
+    /// point — a guard whose file set differs from the consumer's is one library change from
+    /// mattering.
+    #[test]
+    fn a_dot_prefixed_renewal_config_does_not_survive_restore() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_stored_archive_smuggling(&[(
+            "renewal/.hidden.conf",
+            "'pre_hook' = touch /tmp/pwned-hidden\n",
+        )]);
+
+        sandbox.run("restore").expect_success();
+
+        assert!(
+            !sandbox
+                .state_dir()
+                .join("renewal")
+                .join(".hidden.conf")
+                .exists(),
+            "a dot-prefixed renewal config was installed unexamined"
+        );
+    }
+
+    /// **A symlink with an ABSOLUTE target escapes the tree.**
+    ///
+    /// Containment was checked by rebuilding the path from `dirname` + `readlink`, which turns an
+    /// absolute target into `$STAGING/live//etc/shadow` — and `realpath` then collapses the double
+    /// slash back to something *inside* staging. `apply_gateway_access` would afterwards hand the
+    /// escaped path to `chmod -R`, which follows a symlink named on its command line, so
+    /// `archive -> /` meant root running `chmod -R g+rX /` over the whole host.
+    #[test]
+    fn a_symlink_with_an_absolute_target_is_refused() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_on_disk(90);
+        let escapee = sandbox.path("escapee");
+        fs::create_dir_all(escapee.join("live").join(HOST)).unwrap();
+        for name in ["cert.pem", "fullchain.pem", "privkey.pem"] {
+            fs::copy(
+                sandbox.state_dir().join("live").join(HOST).join(name),
+                escapee.join("live").join(HOST).join(name),
+            )
+            .unwrap();
+        }
+        let victim = sandbox.path("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let packed = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "ln -s '{}' '{}/archive' && tar -czf - -C '{}' . | base64 -w0 > '{}'",
+                victim.display(),
+                escapee.display(),
+                escapee.display(),
+                sandbox.stored_secret().display()
+            ))
+            .status()
+            .expect("packing the escaping archive");
+        assert!(packed.success(), "could not build the test archive");
+        let before = sandbox
+            .certificate_on_disk()
+            .expect("a certificate to protect");
+
+        sandbox.run("restore").expect_failure();
+
+        assert_eq!(
+            sandbox.certificate_on_disk().as_deref(),
+            Some(before.as_slice()),
+            "an escaping archive displaced the serving certificate"
+        );
+    }
+
     /// certbot must never be allowed to run its hook directories, on either path.
     ///
     /// Stripping hooks out of the restored config closes one door; `/etc/letsencrypt/renewal-hooks`
