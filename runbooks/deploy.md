@@ -116,18 +116,41 @@ boot -> dig-origin-cert ensure
 **Diagnosing a certificate problem**
 
 ```bash
-# what the host has, and how long it is good for
-openssl x509 -in /etc/letsencrypt/live/node-rpc.dig.net/fullchain.pem -noout -dates -ext subjectAltName
+# what the host has, how long it is good for, and WHICH certificate it is
+certbot certificates | grep -E 'Certificate Name|Serial Number|Domains|Expiry'
 
-# what is stored (size only — never print the value, it contains the private key)
+# what is stored (metadata only — never print the value, it contains the private key
+# and the ACME account key)
 aws secretsmanager describe-secret --secret-id rpc.dig.net/origin-cert
 
-# what Let's Encrypt has actually issued, and for which identifier sets
-curl -s 'https://crt.sh/?q=%25.dig.net&output=json' | jq -r '.[] | "\(.not_before) \(.name_value)"' | sort -u
+# how many generations this host has ever held — one file per issuance
+ls /etc/letsencrypt/archive/node-rpc.dig.net/
 ```
 
-Certificates appear twice on crt.sh (pre-certificate and certificate); de-duplicate before
-counting against the limit of five.
+**To prove a replacement did not issue, compare the SERIAL NUMBER, not a certificate count.** A
+restored instance serves the *same* serial; one that ordered serves a new one. Three signals should
+agree, and they are all local:
+
+| signal | restored | re-issued |
+|---|---|---|
+| `certbot certificates` serial | unchanged | new |
+| `/etc/letsencrypt/archive/…/` | `cert1.pem` only | `cert2.pem` appears |
+| cloud-init log | `restored the origin certificate from …` | `ordering one from Let's Encrypt` |
+
+A fourth: the secret's `VersionId` only changes when the host publishes, so a pure restore leaves it
+alone.
+
+crt.sh is the cross-check against Let's Encrypt itself rather than against our own records, but it
+is not always reachable — it returned `502 Bad Gateway` throughout the #2037 recovery. Do not let a
+verification plan depend on it:
+
+```bash
+curl -s -H 'User-Agent: dig-loop/1.0' 'https://crt.sh/?q=%25.dig.net&output=json' \
+  | jq -r '.[] | "\(.not_before) \(.name_value)"' | sort -u
+```
+
+Certificates appear twice there (pre-certificate and certificate); de-duplicate before counting
+against the limit of five.
 
 If the limit is ever exhausted again, the restore path means a replacement no longer needs an
 issuance at all — check the secret is populated before assuming otherwise. Adding another name to
