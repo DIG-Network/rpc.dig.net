@@ -533,6 +533,65 @@ cp "$live/cert.pem" "$live/fullchain.pem"
         );
     }
 
+    /// The bootstrap exactly as an instance receives it: every Terraform placeholder filled in and
+    /// the helper injected into its heredoc.
+    ///
+    /// Both the syntax check and the size check need this, and they need it to be *faithful* — a
+    /// render that leaves placeholders in measures a script shorter than the real one and parses a
+    /// script that is not the one that boots.
+    fn render_bootstrap() -> String {
+        // Substitute the scalars and check for leftovers BEFORE injecting the helper. The helper is
+        // full of legitimate `${...}` shell expansions, so once it is in there is no way left to
+        // tell a shell expansion from a Terraform placeholder nobody substituted.
+        //
+        // Values are representative in LENGTH, not just in shape, because the size check below
+        // depends on them.
+        let substitutions = [
+            ("cache_root", "/var/lib/dig-node/cache"),
+            ("capsule_bucket", "dig-rpc-node-capsules"),
+            ("region", "us-east-1"),
+            ("cache_cap", "18446744073709551615"),
+            ("gateway_port", "443"),
+            ("dig_node_version", "v0.84.0"),
+            (
+                "dig_node_url",
+                "https://github.com/DIG-Network/dig-node/releases/download/v0.84.0/dig-node-0.84.0-linux-arm64",
+            ),
+            (
+                "dig_node_sha256",
+                "6e52bc28c4b13a20aca608a45861976d256bf94fe56917b12c19bf0df8229a91",
+            ),
+            (
+                "gateway_url",
+                "https://github.com/DIG-Network/rpc.dig.net/releases/download/v0.84.0/rpc-gateway-aarch64",
+            ),
+            (
+                "gateway_sha256",
+                "b3c1f0a9d47e2856190b4fd3a0c7e5218f6d9b40c2a713e85f0d6c94ab27e531",
+            ),
+            ("peer_host", "node-rpc.dig.net"),
+            (
+                "origin_cert_secret",
+                "arn:aws:secretsmanager:us-east-1:000000000000:secret:rpc.dig.net/origin-cert-XXXXXX",
+            ),
+            ("origin_cert_san", "rpc-origin.dig.net"),
+        ];
+
+        let mut rendered = user_data();
+        for (name, value) in substitutions {
+            rendered = rendered.replace(&format!("${{{name}}}"), value);
+        }
+        assert_eq!(
+            rendered.matches("${").count(),
+            1,
+            "the only placeholder left should be ${{origin_cert_script}}; an unsubstituted \
+             Terraform variable means this renders a different script than the instance runs — add \
+             it to the list above"
+        );
+
+        rendered.replace("${origin_cert_script}", &read("infra/dig-origin-cert.sh"))
+    }
+
     /// The bootstrap embeds the helper in a heredoc, so a rendered template — not the template —
     /// is what the instance runs. Parse the rendered form.
     ///
@@ -541,32 +600,7 @@ cp "$live/cert.pem" "$live/fullchain.pem"
     /// start, and the failure would surface as an outage rather than as a red build.
     #[test]
     fn the_rendered_bootstrap_is_valid_bash() {
-        let helper = read("infra/dig-origin-cert.sh");
-        let mut rendered = user_data().replace("${origin_cert_script}", &helper);
-
-        // Every remaining `${name}` is a Terraform variable; a plausible value is enough for a
-        // syntax check.
-        for placeholder in [
-            "cache_root",
-            "capsule_bucket",
-            "region",
-            "cache_cap",
-            "gateway_port",
-            "dig_node_version",
-            "dig_node_url",
-            "dig_node_sha256",
-            "gateway_url",
-            "gateway_sha256",
-            "peer_host",
-            "origin_cert_secret",
-            "origin_cert_san",
-        ] {
-            rendered = rendered.replace(&format!("${{{placeholder}}}"), "placeholder");
-        }
-        assert!(
-            !rendered.contains("${"),
-            "the render left an unsubstituted Terraform placeholder; add it to this list"
-        );
+        let rendered = render_bootstrap();
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("user_data.sh");
@@ -596,8 +630,7 @@ cp "$live/cert.pem" "$live/fullchain.pem"
         /// EC2's ceiling on the bytes handed to `RunInstances`.
         const USER_DATA_LIMIT: usize = 16 * 1024;
 
-        let helper = read("infra/dig-origin-cert.sh");
-        let rendered = user_data().replace("${origin_cert_script}", &helper);
+        let rendered = render_bootstrap();
 
         // Terraform's base64gzip uses Go's default compression level, which is gzip's own default.
         let compressed = Command::new("bash")
