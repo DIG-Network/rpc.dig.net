@@ -219,6 +219,13 @@ ExecStart=/usr/local/sbin/dig-origin-cert renew
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
+
+# systemd disables the start timeout for Type=oneshot by default, so without this a single wedged
+# run holds the unit in `activating` forever and every later timer firing merges into it — renewal
+# silently stops. This unit hands an attacker-influenceable payload to openssl and certbot as root;
+# whatever guards those calls, an unbounded root job consuming untrusted input is the wrong shape.
+# 20 minutes is far beyond a real dns-01 renewal (~1-2 min) and far below the 12h timer period.
+TimeoutStartSec=20min
 UNIT
 
 cat >/etc/systemd/system/certbot-renew.timer <<'UNIT'

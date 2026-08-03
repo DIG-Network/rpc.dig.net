@@ -252,7 +252,7 @@ archive_names_are_permitted() {
       return 1
       ;;
     esac
-  done < <(tar -tf "$tarball")
+  done < <(tar -tf "$tarball" || echo "//unreadable")
 }
 
 # Nothing in the unpacked tree escapes it, and nothing in it can escalate.
@@ -261,9 +261,9 @@ archive_names_are_permitted() {
 # are legitimately relative and full of `..` (`../../archive/<host>/fullchain1.pem`) — the question
 # is never whether a target contains `..`, only where it lands.
 staged_tree_is_contained() {
-  local link target offender
+  local root="$1" link target offender
 
-  offender="$(find "$STAGING" ! -type f ! -type d ! -type l -print -quit)"
+  offender="$(find "$root" ! -type f ! -type d ! -type l -print -quit)"
   if [ -n "$offender" ]; then
     log "the stored archive contains a special file: $offender"
     return 1
@@ -274,7 +274,7 @@ staged_tree_is_contained() {
   # measured). It is kept because that flag is one edit away from being "fixed" by someone who
   # wants archive permissions preserved, and this is what would notice. The property the test
   # asserts is "no setuid file reaches the state directory" — deliberately not "this branch runs".
-  offender="$(find "$STAGING" -perm /6000 -print -quit)"
+  offender="$(find "$root" -perm /6000 -print -quit)"
   if [ -n "$offender" ]; then
     log "the stored archive contains a setuid or setgid file: $offender"
     return 1
@@ -285,14 +285,14 @@ staged_tree_is_contained() {
     # absolute target into `$STAGING/live//etc/shadow`, and realpath then collapses the double
     # slash to something inside the tree — so `-> /etc/shadow` was read as `live/etc/shadow` and
     # accepted, while the far more exotic `-> ../../../etc/shadow` was correctly rejected.
-    target="$(realpath -m --relative-to="$STAGING" "$link")"
+    target="$(realpath -m --relative-to="$root" "$link")"
     case "$target" in
     /* | .. | ../*)
       log "the stored archive has a symlink pointing outside the state directory: $link"
       return 1
       ;;
     esac
-  done < <(find "$STAGING" -type l)
+  done < <(find "$root" -type l)
 }
 
 # Reduce every restored renewal config to keys we recognise, using certbot's OWN parser.
@@ -402,21 +402,23 @@ def sanitize(renewal_dir):
     return dropped
 
 
+# Anything unforeseen — configobj missing OR present-but-broken, a full disk during write(), a
+# permission error on remove(), an encoding surprise — is a fact about this HOST, not evidence
+# about the payload, so it must not fall out as the payload code. Only the parse failure inside
+# sanitize() is allowed to claim that.
+#
+# The import is INSIDE this block on purpose. Guarding it with `except ImportError` alone named the
+# failure mode someone thought of: a half-written configobj.py raises SyntaxError and a mismatched
+# compiled extension raises something else again, and each would have exited 1 and been read as
+# "nothing is stored" — a host fault spending a rate-limited issuance.
 try:
     from configobj import ConfigObj
-except ImportError:
-    print("configobj is unavailable, so a renewal config cannot be examined", file=sys.stderr)
-    raise SystemExit(HOST_FAULT)
 
-# Anything unforeseen — a full disk during write(), a permission error on remove(), an encoding
-# surprise — is a fact about this HOST, not evidence about the payload, so it must not fall out as
-# the payload code. Only the parse failure above is allowed to claim that.
-try:
     entries = sanitize(sys.argv[1])
 except SystemExit:
     raise
 except BaseException as exc:
-    print("unexpected failure examining renewal configs: %r" % (exc,), file=sys.stderr)
+    print("cannot examine renewal configs on this host: %r" % (exc,), file=sys.stderr)
     raise SystemExit(HOST_FAULT)
 
 # These names came out of an attacker-controllable file and are about to be logged. Strip anything
@@ -496,7 +498,7 @@ restore() {
     log "the stored certificate is not a readable gzipped tar"
     return "$RESTORE_ABSENT"
   fi
-  if ! staged_tree_is_contained; then
+  if ! staged_tree_is_contained "$STAGING"; then
     return "$RESTORE_ABSENT"
   fi
   if ! pem_pair_is_usable "$STAGING/live/$PEER_HOST"; then
@@ -518,7 +520,8 @@ restore() {
     return "$RESTORE_ABSENT"
     ;;
   *)
-    log "cannot examine a renewal config on this host (status $sanitize_status);"       "refusing to judge the stored payload"
+    log "cannot examine a renewal config on this host (status $sanitize_status);"\
+      "refusing to judge the stored payload"
     return "$RESTORE_FAILED"
     ;;
   esac
@@ -596,7 +599,9 @@ save() {
   # durable copy stale and every later replacement spending an issuance. Years from now, with no
   # signal. Say something while there is still room to act.
   if [ "$((encoded_bytes * 100 / MAX_ENCODED_BYTES))" -ge 70 ]; then
-    log "NOTE: the certbot state is $encoded_bytes of $MAX_ENCODED_BYTES bytes. It grows one"       "certificate generation per renewal; when it crosses the ceiling, publishing stops and the"       "durable copy silently goes stale. Prune old generations from archive/ (dig_ecosystem#2055)."
+    log "NOTE: the certbot state is $encoded_bytes of $MAX_ENCODED_BYTES bytes. It grows one"\
+      "certificate generation per renewal; when it crosses the ceiling, publishing stops and the"\
+      "durable copy silently goes stale. Prune old generations from archive/ (dig_ecosystem#2055)."
   fi
 
   local attempt
@@ -627,9 +632,12 @@ stored_certificate_fingerprint() {
   mkdir -p "$peek"
 
   fetch_stored_payload "$WORK/peek.b64" >/dev/null 2>&1 || return 1
+  chmod 600 "$WORK/peek.b64"
   base64 -d <"$WORK/peek.b64" >"$WORK/peek.tar.gz" 2>/dev/null || return 1
+  chmod 600 "$WORK/peek.tar.gz"
   gzip -dc "$WORK/peek.tar.gz" 2>/dev/null |
     head -c "$((MAX_DECOMPRESSED_BYTES + 1))" >"$WORK/peek.tar" || true
+  chmod 600 "$WORK/peek.tar"
   # The WHOLE tree, not just `live/$PEER_HOST/cert.pem`. On real certbot state that path is a
   # relative symlink into `archive/`, so extracting it alone yields a dangling link, `openssl`
   # fails, and this function can only ever fail — which silently turns the reconciliation it exists
@@ -639,8 +647,17 @@ stored_certificate_fingerprint() {
   # Same member-name guard as `restore`, because this unpacks an attacker-influenceable archive —
   # into $WORK rather than /etc, but unchecked extraction is not a habit worth having. Size is
   # already bounded by the decompression ceiling above.
+  # BOTH guards, the same two `restore` uses. An earlier version had only the name check and then
+  # a `[ -f ]` — which names the file TYPE someone thought of and, worse, FOLLOWS the symlink and
+  # tests the TARGET. An absolute link to a huge sparse file is a regular file, so it passed, and
+  # `openssl` then read it: measured at 22 TB, `openssl x509` was still churning when killed at 25s
+  # because PEM_read_bio hunts `-----BEGIN` 255 bytes at a time. The unit calling this is
+  # Type=oneshot, for which systemd disables the start timeout, so the renewal timer wedges
+  # permanently and the certificate expires ~90 days later. Containment is the property; file type
+  # is a proxy for it, and proxies get walked around.
   archive_names_are_permitted "$WORK/peek.tar" || return 1
   tar -xf "$WORK/peek.tar" -C "$peek" --no-same-owner --no-same-permissions 2>/dev/null || return 1
+  staged_tree_is_contained "$peek" || return 1
 
   [ -f "$peek/live/$PEER_HOST/cert.pem" ] || return 1
   openssl x509 -in "$peek/live/$PEER_HOST/cert.pem" -noout -fingerprint -sha256 2>/dev/null
