@@ -798,6 +798,92 @@ cp "$live/cert.pem" "$live/fullchain.pem"
         );
     }
 
+    /// A special file has no business in certbot state, and unlike the setuid case tar really does
+    /// extract one — so this guard is genuinely reachable and worth holding.
+    #[test]
+    fn an_archive_containing_a_special_file_is_refused() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_on_disk(90);
+        let staged = sandbox.path("with-fifo");
+        fs::create_dir_all(staged.join("live").join(HOST)).unwrap();
+        for name in ["cert.pem", "fullchain.pem", "privkey.pem"] {
+            fs::copy(
+                sandbox.state_dir().join("live").join(HOST).join(name),
+                staged.join("live").join(HOST).join(name),
+            )
+            .unwrap();
+        }
+        let packed = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "mkfifo '{0}/live/pipe' && tar -czf - -C '{0}' . | base64 -w0 > '{1}'",
+                staged.display(),
+                sandbox.stored_secret().display()
+            ))
+            .status()
+            .expect("packing an archive with a fifo");
+        assert!(packed.success(), "could not build the test archive");
+        let before = sandbox
+            .certificate_on_disk()
+            .expect("a certificate to protect");
+
+        sandbox.run("restore").expect_failure();
+
+        assert_eq!(
+            sandbox.certificate_on_disk().as_deref(),
+            Some(before.as_slice()),
+            "an archive carrying a special file displaced the serving certificate"
+        );
+    }
+
+    /// No setuid file may reach the state directory — asserted as a PROPERTY, not as a branch.
+    ///
+    /// Two independent things enforce it: `--no-same-permissions` masks the bits off during
+    /// extraction (measured: a 4755 member lands as 755), and `staged_tree_is_contained` refuses
+    /// the archive outright. The first makes the second unreachable today, so a test aimed at the
+    /// guard would report coverage of a line it never runs. Aiming at the outcome instead keeps
+    /// passing if either mechanism is removed, and fails if both are.
+    #[test]
+    fn a_setuid_member_never_becomes_a_setuid_file_in_the_state_directory() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_on_disk(90);
+        let staged = sandbox.path("with-setuid");
+        fs::create_dir_all(staged.join("live").join(HOST)).unwrap();
+        for name in ["cert.pem", "fullchain.pem", "privkey.pem"] {
+            fs::copy(
+                sandbox.state_dir().join("live").join(HOST).join(name),
+                staged.join("live").join(HOST).join(name),
+            )
+            .unwrap();
+        }
+        let packed = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "printf '#!/bin/sh\\n' > '{0}/live/rooted' && chmod 4755 '{0}/live/rooted' && \
+                 tar -czf - -C '{0}' . | base64 -w0 > '{1}'",
+                staged.display(),
+                sandbox.stored_secret().display()
+            ))
+            .status()
+            .expect("packing an archive with a setuid file");
+        assert!(packed.success(), "could not build the test archive");
+
+        // Either outcome is acceptable — refused, or installed with the bits gone. What is not
+        // acceptable is a setuid file sitting in the state directory afterwards.
+        let _ = sandbox.run("restore");
+
+        let survivors = Command::new("find")
+            .arg(sandbox.state_dir())
+            .args(["-perm", "/6000"])
+            .output()
+            .expect("find");
+        let survivors = String::from_utf8_lossy(&survivors.stdout);
+        assert!(
+            survivors.trim().is_empty(),
+            "a setuid file reached the state directory:\n{survivors}"
+        );
+    }
+
     /// certbot must never be allowed to run its hook directories, on either path.
     ///
     /// Stripping hooks out of the restored config closes one door; `/etc/letsencrypt/renewal-hooks`

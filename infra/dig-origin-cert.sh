@@ -252,6 +252,11 @@ staged_tree_is_contained() {
     return 1
   fi
 
+  # A BACKSTOP, not the primary control, and it cannot fire as things stand: the extraction above
+  # passes `--no-same-permissions`, which masks setuid and setgid off (a 4755 member lands as 755,
+  # measured). It is kept because that flag is one edit away from being "fixed" by someone who
+  # wants archive permissions preserved, and this is what would notice. The property the test
+  # asserts is "no setuid file reaches the state directory" — deliberately not "this branch runs".
   offender="$(find "$STAGING" -perm /6000 -print -quit)"
   if [ -n "$offender" ]; then
     log "the stored archive contains a setuid or setgid file: $offender"
