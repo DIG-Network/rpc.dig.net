@@ -69,7 +69,7 @@ jobs:
       - name: publish the binary as a release asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ vars.DIG_NODE_VERSION }}
         run: |
           set -euo pipefail
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
@@ -97,7 +97,7 @@ jobs:
 
       - name: terraform apply
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ vars.DIG_NODE_VERSION }}
         run: |
           set -euo pipefail
           GATEWAY_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/rpc-gateway-aarch64"
