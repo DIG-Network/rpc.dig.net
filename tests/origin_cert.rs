@@ -143,6 +143,13 @@ mod behaviour {
         format!("{}:{}", id_field("-un"), current_group())
     }
 
+    fn mode_of(path: &std::path::Path) -> u32 {
+        fs::metadata(path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+            .permissions()
+            .mode()
+    }
+
     fn id_field(flag: &str) -> String {
         let out = Command::new("id").arg(flag).output().expect("id");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -883,6 +890,74 @@ cp "$live/cert.pem" "$live/fullchain.pem"
         assert!(
             sandbox.certificate_on_disk().is_some(),
             "the issued certificate should be on disk and serving"
+        );
+    }
+
+    /// **A restored state directory must still be walkable by the gateway.**
+    ///
+    /// Restore normalises every directory it installs to 700, root included, so the certificate
+    /// ends up present, valid, correctly grouped — and unreachable, because the unprivileged
+    /// gateway cannot traverse `/etc/letsencrypt` to get to it. `check` runs as root, passes, and
+    /// enables the gateway straight into the crash loop this change exists to remove.
+    ///
+    /// Every earlier permission test was satisfied by the test user OWNING the files, so none of
+    /// them could see this. A real cross-user read on the live host is what found it; this asserts
+    /// the mode that made it work.
+    #[test]
+    fn a_restored_state_directory_is_still_traversable() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_only_in_the_secret(90);
+
+        sandbox.run("ensure").expect_success();
+
+        let mode = mode_of(&sandbox.state_dir());
+        assert!(
+            mode & 0o111 != 0,
+            "the state root is {mode:o}; the gateway cannot walk into it to reach the certificate"
+        );
+    }
+
+    /// The read grant covers THIS certificate, not every certificate certbot holds.
+    ///
+    /// The comment above `apply_gateway_access` promises exactly that, and for a while the code
+    /// granted `chmod -R g+rX` over all of `live/` and `archive/` instead — harmless with one
+    /// cert-name, which is why it is worth fixing before someone adds a second and trusts the
+    /// comment.
+    #[test]
+    fn the_read_grant_does_not_reach_another_certificates_private_key() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_on_disk(90);
+        let other = sandbox
+            .state_dir()
+            .join("archive")
+            .join("other.example.com");
+        fs::create_dir_all(&other).unwrap();
+        let stranger = other.join("privkey1.pem");
+        fs::write(&stranger, "a stranger's key").unwrap();
+        fs::set_permissions(&stranger, fs::Permissions::from_mode(0o600)).unwrap();
+
+        sandbox.run("ensure").expect_success();
+
+        assert!(
+            stranger.exists(),
+            "the second cert-name vanished, so this test would prove nothing"
+        );
+        assert_eq!(
+            mode_of(&stranger) & 0o040,
+            0,
+            "another cert-name's private key became group-readable: {:o}",
+            mode_of(&stranger)
+        );
+        let mine = sandbox
+            .state_dir()
+            .join("live")
+            .join(HOST)
+            .join("fullchain.pem");
+        assert_ne!(
+            mode_of(&mine) & 0o040,
+            0,
+            "this host's own certificate must stay group-readable: {:o}",
+            mode_of(&mine)
         );
     }
 

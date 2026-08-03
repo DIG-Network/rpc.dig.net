@@ -164,17 +164,32 @@ certificate_fingerprint() {
 apply_gateway_access() {
   getent group "$CERT_GROUP" >/dev/null || groupadd -f "$CERT_GROUP"
 
-  # Only the directories that exist: certbot creates `archive/` when it writes its first
-  # certificate, so on a host that has only ever restored, or during a first issue, it may not be
-  # there yet. Naming a missing path here would abort the whole bootstrap over nothing.
-  # `! -L` is the load-bearing half. `chmod -R` ignores symlinks it meets during traversal but
-  # FOLLOWS one named on the command line, so a restored `archive -> /` would have had root run
-  # `chmod -R g+rX /` across the whole host. `-d` alone does not catch it: it follows the link too.
-  local dir
+  # The state directory itself must stay traversable, or nothing below matters: the gateway cannot
+  # open a file it cannot walk to. `restore` normalises every directory it installs to 700, root
+  # included, so without this line the first restored boot would hand systemd a gateway that cannot
+  # read its own certificate — a crash loop, which is the exact failure this change exists to
+  # remove. 755 is what certbot ships and what this host already had before any of this.
+  if ! chmod 755 "$STATE_DIR"; then
+    log "could not make $STATE_DIR traversable"
+    return 1
+  fi
+
+  # SCOPED TO THIS CERTIFICATE. `live/` and `archive/` get traverse-only — x, deliberately not r —
+  # because the gateway has no business listing what else certbot holds, and the recursive read is
+  # confined to this host's own cert-name. That is what makes the claim above true rather than
+  # aspirational: add a second name to this host tomorrow and its private key stays unreadable.
+  local dir host_dir
   for dir in "$STATE_DIR/live" "$STATE_DIR/archive"; do
     [ -d "$dir" ] && [ ! -L "$dir" ] || continue
-    if ! chgrp -h -R "$CERT_GROUP" "$dir" || ! chmod -R g+rX "$dir"; then
-      log "could not give $CERT_GROUP read access to $dir"
+    if ! chgrp -h "$CERT_GROUP" "$dir" || ! chmod g+x "$dir"; then
+      log "could not make $dir traversable by $CERT_GROUP"
+      return 1
+    fi
+
+    host_dir="$dir/$PEER_HOST"
+    [ -d "$host_dir" ] && [ ! -L "$host_dir" ] || continue
+    if ! chgrp -h -R "$CERT_GROUP" "$host_dir" || ! chmod -R g+rX "$host_dir"; then
+      log "could not give $CERT_GROUP read access to $host_dir"
       return 1
     fi
   done
@@ -512,6 +527,9 @@ restore() {
 ' ';')"
   fi
 
+  # Ownership and modes are imposed by this host, never taken from the archive. The state root is
+  # then reopened to 755 by apply_gateway_access — clamping it to 700 here and forgetting that is
+  # how a restore locks the unprivileged gateway out of a certificate it can see but not reach.
   if ! chown -R "$STATE_OWNER" "$STAGING" ||
     ! find "$STAGING" -type d -exec chmod 700 {} + ||
     ! find "$STAGING" -type f -exec chmod 600 {} +; then
@@ -520,7 +538,10 @@ restore() {
   fi
 
   install_state || return "$RESTORE_FAILED"
-  apply_gateway_access
+  if ! apply_gateway_access; then
+    log "restored the certificate but could not make it readable by the gateway"
+    return "$RESTORE_FAILED"
+  fi
   log "restored the origin certificate from $SECRET_ID"
 }
 
@@ -583,6 +604,26 @@ save() {
     fi
   done
   return 1
+}
+
+# The certificate the DURABLE COPY holds right now, as a fingerprint, or nothing if that cannot be
+# established.
+#
+# Peeks at only one file out of the stored payload. It exists so `renew` can ask the question that
+# actually matters — "is the secret what this host is serving?" — instead of the one that is merely
+# easy to ask, "did something change during this run".
+stored_certificate_fingerprint() {
+  local peek="$WORK/peek"
+  rm -rf "$peek"
+  mkdir -p "$peek"
+
+  fetch_stored_payload "$WORK/peek.b64" >/dev/null 2>&1 || return 1
+  base64 -d <"$WORK/peek.b64" >"$WORK/peek.tar.gz" 2>/dev/null || return 1
+  gzip -dc "$WORK/peek.tar.gz" 2>/dev/null |
+    head -c "$((MAX_DECOMPRESSED_BYTES + 1))" >"$WORK/peek.tar" || true
+  tar -xf "$WORK/peek.tar" -C "$peek" --no-same-owner --no-same-permissions     "./live/$PEER_HOST/cert.pem" 2>/dev/null || return 1
+
+  openssl x509 -in "$peek/live/$PEER_HOST/cert.pem" -noout -fingerprint -sha256 2>/dev/null
 }
 
 # What a failed publish actually costs, said once, because all three callers must say the same
@@ -648,7 +689,24 @@ renew() {
 
   after="$(certificate_fingerprint)"
   if [ "$before" = "$after" ]; then
-    log "nothing was due; the stored certificate is still current"
+    # Nothing renewed — which is NOT the same as "the durable copy is current", and conflating the
+    # two leaves a missed publish unrepaired forever. Once certbot has written a new certificate,
+    # `before` and `after` only diverge inside that one run; every later run recomputes `before`
+    # from the new on-disk certificate, certbot reports nothing due, and the secret keeps the
+    # PREVIOUS certificate until the next real renewal ~60 days later. A replacement in that window
+    # restores the stale copy, renews, and spends an issuance — once per deploy, five deploys to
+    # the rate limit. So ask the invariant, not the event.
+    local stored
+    stored="$(stored_certificate_fingerprint || true)"
+    if [ -n "$stored" ] && [ "$stored" = "$after" ]; then
+      log "nothing was due; the durable copy matches what is being served"
+      return 0
+    fi
+
+    # Includes the case where the durable copy could not be read at all: republishing is idempotent
+    # and cheap, and being wrong in this direction costs one API call rather than an issuance.
+    log "nothing was due, but the durable copy is not what this host is serving; republishing"
+    save || warn_not_published
     return 0
   fi
 
