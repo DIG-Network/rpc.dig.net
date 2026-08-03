@@ -120,7 +120,18 @@ resource "aws_instance" "node" {
     purpose = "rpc.dig.net read tier + public peer"
   }
 
-  depends_on = [aws_s3_bucket_policy.capsules]
+  # Terraform infers no ordering between an instance and the policies on the role it assumes, so
+  # without these the instance can boot before its own permissions exist. Every one of them is on
+  # the boot path — the capsule mount, certbot's dns-01 challenge, and restoring the certificate —
+  # and the last is the expensive one: a first boot that cannot read the secret would fall through
+  # to ordering a certificate, spending one of five weekly issuances to re-obtain something it
+  # already had.
+  depends_on = [
+    aws_s3_bucket_policy.capsules,
+    aws_iam_role_policy.capsule_read,
+    aws_iam_role_policy.certbot_dns01,
+    aws_iam_role_policy.origin_cert_secret,
+  ]
 }
 
 # A stable address for the peer identity. Peers cache addresses, and a node whose address changes

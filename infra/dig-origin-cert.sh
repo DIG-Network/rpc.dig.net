@@ -15,10 +15,25 @@
 # only for the two things that genuinely need it — a first certificate, and a real renewal — so
 # the rate limit stops being reachable by deploying.
 #
-# WHAT IS STORED, AND WHY IT IS THE WHOLE DIRECTORY. The payload is a gzipped tar of the certbot
-# state directory, not just the two PEM files. certbot needs its renewal config, its archive and
-# its ACME account to renew; restoring only the PEMs would serve traffic today and then silently
-# stop renewing, which fails ~60 days later, far from whatever caused it.
+# TWO RULES EVERY BRANCH HERE OBEYS.
+#
+#   1. **Never order a certificate on an unknown state.** Ordering is the expensive, rate-limited
+#      act, so it happens only once this script has positively established that no certificate is
+#      available — not merely that it failed to find one. A failed API call, a throttle, an IAM
+#      permission still propagating: none of those may lead to an order.
+#
+#   2. **The stored payload is UNTRUSTED INPUT.** The node's own role can write that secret, so an
+#      attacker who reaches the unprivileged `dignode` account can replace it. This script then
+#      unpacks it as root and hands it to certbot, which also runs as root — and, because a
+#      replacement instance restores the same payload, anything smuggled in would survive the one
+#      remediation this stack has. So the archive is validated, stripped and normalised before it
+#      is allowed anywhere near /etc, and certbot is told never to run directory hooks.
+#
+# WHAT IS STORED, AND WHY IT IS THE WHOLE STATE. The payload is a gzipped tar of certbot's state
+# directories, not just the two PEM files. certbot needs its renewal config, its archive and its
+# ACME account to renew; restoring only the PEMs would serve traffic today and then silently stop
+# renewing, which fails ~60 days later, far from whatever caused it. It carries only the
+# directories certbot owns — never `renewal-hooks/`, which exists to execute things.
 #
 # KEY-MATERIAL DISCIPLINE. The private key moves host <-> Secrets Manager and never through a log
 # line, an argument list, or a command's stdout. `set -x` is deliberately not enabled here even
@@ -40,6 +55,15 @@ readonly REGION="${AWS_DEFAULT_REGION:?the AWS region must be set}"
 readonly STATE_DIR="${DIG_ORIGIN_CERT_STATE_DIR:-/etc/letsencrypt}"
 readonly LIVE_DIR="$STATE_DIR/live/$PEER_HOST"
 
+# The group that may read the live certificate. The gateway runs unprivileged and joins it.
+# Overridable only so the tests can name a group they already belong to; production never sets it.
+readonly CERT_GROUP="${DIG_ORIGIN_CERT_GROUP:-certaccess}"
+
+# The only top-level entries certbot owns, and therefore the only ones the payload may carry.
+# `renewal-hooks/` is deliberately absent: its whole purpose is to hold scripts certbot executes
+# as root, which is exactly what an attacker who can write the secret would put there.
+readonly CERTBOT_STATE_DIRS=(live archive renewal accounts csr keys)
+
 # certbot's own renewal threshold. Matching it means a certificate restored inside the window is
 # renewed at boot rather than waiting for the timer's next run.
 readonly RENEW_WITHIN_DAYS=30
@@ -49,10 +73,26 @@ readonly RENEW_WITHIN_DAYS=30
 # so this is roughly seven times the real size.
 readonly MAX_ENCODED_BYTES=60000
 
+# How a restore attempt ended. Three outcomes and not two, because ABSENT and FAILED demand
+# OPPOSITE responses: one may lead to an order, the other must never.
+readonly RESTORE_OK=0
+readonly RESTORE_ABSENT=1 # positively established that nothing usable is stored
+readonly RESTORE_FAILED=2 # could not establish anything — the state is unknown
+
+# Backoff between attempts to read the secret. Overridable only so the tests that exercise the
+# unreadable-secret path do not spend fifteen seconds sleeping; production never sets it.
+readonly RETRY_DELAY_SECONDS="${DIG_ORIGIN_CERT_RETRY_DELAY:-5}"
+
 WORK="$(mktemp -d)"
 readonly WORK
 chmod 700 "$WORK"
-trap 'rm -rf "$WORK"' EXIT
+
+# Staging is a sibling of the state directory so installing it is an atomic rename (see
+# install_state). Only staging is cleaned up on exit: if a rollback ever fails, the displaced
+# original is the last copy of the certificate and must survive for an operator to recover.
+readonly STAGING="$STATE_DIR.restoring-$$"
+readonly DISPLACED="$STATE_DIR.replaced-$$"
+trap 'rm -rf "$WORK" "$STAGING"' EXIT
 
 log() {
   printf '%s dig-origin-cert: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2
@@ -65,8 +105,26 @@ die() {
 
 # --- Reading the certificate on disk -----------------------------------------------------------
 
+# A certificate and a key that parse, and that belong to each other.
+#
+# "Non-empty" is not "a certificate". A one-byte fullchain.pem passes a `-s` test, replaces working
+# state, and hands systemd a gateway that exits at startup — the crash loop this whole change
+# exists to make impossible. Parsing both halves and matching their public keys is what makes
+# "there is a usable certificate here" an honest claim.
+pem_pair_is_usable() {
+  local dir="$1" cert_pubkey key_pubkey
+  cert_pubkey="$(openssl x509 -in "$dir/fullchain.pem" -noout -pubkey 2>/dev/null)" || return 1
+  key_pubkey="$(openssl pkey -in "$dir/privkey.pem" -pubout 2>/dev/null)" || return 1
+  [ -n "$cert_pubkey" ] && [ "$cert_pubkey" = "$key_pubkey" ]
+}
+
 certificate_is_present() {
-  [ -s "$LIVE_DIR/fullchain.pem" ] && [ -s "$LIVE_DIR/privkey.pem" ]
+  pem_pair_is_usable "$LIVE_DIR"
+}
+
+# True while the certificate has not yet expired — the bar for "can still serve traffic".
+certificate_is_valid_now() {
+  openssl x509 -in "$LIVE_DIR/cert.pem" -noout -checkend 0 >/dev/null 2>&1
 }
 
 # True while the certificate has more than RENEW_WITHIN_DAYS of life left.
@@ -75,65 +133,216 @@ certificate_is_fresh() {
     -checkend "$((RENEW_WITHIN_DAYS * 86400))" >/dev/null 2>&1
 }
 
+certificate_expiry() {
+  openssl x509 -in "$LIVE_DIR/cert.pem" -noout -enddate 2>/dev/null || echo "notAfter=unknown"
+}
+
 # A stable identity for "which certificate is this", used to tell a real renewal from a no-op.
 certificate_fingerprint() {
   openssl x509 -in "$LIVE_DIR/cert.pem" -noout -fingerprint -sha256 2>/dev/null || echo absent
 }
 
+# The gateway runs unprivileged, so it needs group read on the live certificate — without opening
+# the whole archive, so the private keys of any other certificate on this host stay unreadable.
+#
+# Re-applied after every change rather than only at boot: certbot writes each renewed certificate
+# root-only, so a renewal that did not re-apply this would leave the gateway unable to read the
+# very certificate it was just restarted to pick up. That failure would land ~60 days after anyone
+# last touched this.
+#
+# `chgrp -h` so a symlink's own group changes rather than its target's — otherwise a restored
+# archive could point a `live/` entry at any root-owned file and hand its group away.
+apply_gateway_access() {
+  getent group "$CERT_GROUP" >/dev/null || groupadd -f "$CERT_GROUP"
+
+  # Only the directories that exist: certbot creates `archive/` when it writes its first
+  # certificate, so on a host that has only ever restored, or during a first issue, it may not be
+  # there yet. Naming a missing path here would abort the whole bootstrap over nothing.
+  local dir
+  for dir in "$STATE_DIR/live" "$STATE_DIR/archive"; do
+    [ -d "$dir" ] || continue
+    chgrp -h -R "$CERT_GROUP" "$dir"
+    chmod -R g+rX "$dir"
+  done
+}
+
 # --- restore ------------------------------------------------------------------------------------
 
-# Replace the local certbot state with the copy in Secrets Manager.
+# Fetch the stored payload into "$1". Returns one of the three RESTORE_* outcomes.
 #
-# Every step validates before anything on disk is touched. That ordering is the point: restore
-# overwrites the state directory wholesale, so a truncated or wrong-shaped payload that got
-# halfway through would leave the host with neither the stored certificate nor the one it was
-# already serving — turning a recoverable problem back into the outage.
+# Telling "the secret has no version" apart from "the call did not succeed" is the whole job here.
+# Collapsing them into one "nothing stored" is what would let a throttle, an AccessDenied while an
+# IAM policy is still propagating, or a network blip spend one of five weekly issuances.
+fetch_stored_payload() {
+  local into="$1" attempt
+  for attempt in 1 2 3; do
+    if aws secretsmanager get-secret-value \
+      --region "$REGION" --secret-id "$SECRET_ID" \
+      --query SecretString --output text >"$into" 2>"$WORK/aws.err"; then
+      return "$RESTORE_OK"
+    fi
+
+    # Both "no such secret" and "no value for staging label AWSCURRENT" report this, and both are
+    # definite: there is genuinely nothing to restore.
+    if grep -q "ResourceNotFoundException" "$WORK/aws.err"; then
+      log "the secret holds no certificate yet"
+      return "$RESTORE_ABSENT"
+    fi
+
+    log "could not read $SECRET_ID (attempt $attempt of 3): $(tail -1 "$WORK/aws.err")"
+    if [ "$attempt" -lt 3 ]; then
+      sleep "$((attempt * RETRY_DELAY_SECONDS))"
+    fi
+  done
+  return "$RESTORE_FAILED"
+}
+
+# Every member of the archive names a path certbot owns, inside the tree.
 #
-# Returns non-zero for "nothing usable is stored", which is a normal state on a first boot, not
-# an error.
-restore() {
-  if ! aws secretsmanager get-secret-value \
-        --region "$REGION" --secret-id "$SECRET_ID" \
-        --query SecretString --output text >"$WORK/payload.b64" 2>/dev/null; then
-    log "no certificate stored in $SECRET_ID"
-    return 1
-  fi
-  chmod 600 "$WORK/payload.b64"
+# tar refuses `..` members already, but this validates rather than inherits, and it adds the check
+# tar cannot make: that the archive contains ONLY certbot's own state. A payload that also carried
+# `renewal-hooks/pre/x.sh` would look like a certificate and execute as root at the next renewal.
+archive_names_are_permitted() {
+  local member top
+  while IFS= read -r member; do
+    member="${member#./}"
+    [ -n "$member" ] && [ "$member" != "." ] || continue
 
-  if [ ! -s "$WORK/payload.b64" ]; then
-    log "the stored certificate is empty"
-    return 1
-  fi
-  if ! base64 -d <"$WORK/payload.b64" >"$WORK/state.tar.gz" 2>/dev/null; then
-    log "the stored certificate is not valid base64"
+    case "$member" in
+    /* | ../* | */../* | */..)
+      log "the stored archive names a member outside the state directory: $member"
+      return 1
+      ;;
+    esac
+
+    top="${member%%/*}"
+    case " ${CERTBOT_STATE_DIRS[*]} " in
+    *" $top "*) ;;
+    *)
+      log "the stored archive contains '$member', which is not certbot state"
+      return 1
+      ;;
+    esac
+  done < <(tar -tzf "$WORK/state.tar.gz")
+}
+
+# Nothing in the unpacked tree escapes it, and nothing in it can escalate.
+#
+# Symlink targets are resolved rather than pattern-matched, because certbot's own `live/` entries
+# are legitimately relative and full of `..` (`../../archive/<host>/fullchain1.pem`) — the question
+# is never whether a target contains `..`, only where it lands.
+staged_tree_is_contained() {
+  local link target offender
+
+  offender="$(find "$STAGING" ! -type f ! -type d ! -type l -print -quit)"
+  if [ -n "$offender" ]; then
+    log "the stored archive contains a special file: $offender"
     return 1
   fi
 
-  mkdir -p "$WORK/unpacked"
-  if ! tar -xzf "$WORK/state.tar.gz" -C "$WORK/unpacked" 2>/dev/null; then
-    log "the stored certificate is not a readable gzipped tar"
-    return 1
-  fi
-  if [ ! -s "$WORK/unpacked/live/$PEER_HOST/fullchain.pem" ] ||
-     [ ! -s "$WORK/unpacked/live/$PEER_HOST/privkey.pem" ]; then
-    log "the stored archive holds no certificate for $PEER_HOST"
+  offender="$(find "$STAGING" -perm /6000 -print -quit)"
+  if [ -n "$offender" ]; then
+    log "the stored archive contains a setuid or setgid file: $offender"
     return 1
   fi
 
-  # Move the old state aside rather than deleting it, so a failure part-way through installing
-  # the new one is recoverable instead of terminal.
-  local displaced="$STATE_DIR.replaced-$$"
-  if [ -d "$STATE_DIR" ] && ! mv "$STATE_DIR" "$displaced"; then
+  while IFS= read -r link; do
+    target="$(realpath -m --relative-to="$STAGING" "$(dirname "$link")/$(readlink "$link")")"
+    case "$target" in
+    /* | .. | ../*)
+      log "the stored archive has a symlink pointing outside the state directory: $link"
+      return 1
+      ;;
+    esac
+  done < <(find "$STAGING" -type l)
+}
+
+# certbot executes any `*_hook` recorded in a renewal config, as root, on every renewal. Those
+# lines are not part of a certificate, so strip them: a poisoned archive must not be able to
+# smuggle a command into the renewal path. `--no-directory-hooks` closes the other half.
+strip_renewal_hooks() {
+  local conf
+  for conf in "$STAGING"/renewal/*.conf; do
+    [ -e "$conf" ] || continue
+    sed -i -E '/^[[:space:]]*[a-z_]*hook[[:space:]]*=/d' "$conf"
+  done
+}
+
+# Swap the staged directory into place.
+#
+# Both moves are renames within the same parent directory, so each is atomic: there is no moment
+# where the state directory is half-written. Unpacking under /tmp instead would make this a
+# cross-filesystem copy-then-delete, whose failure leaves exactly the both-copies-gone state this
+# is written to prevent.
+install_state() {
+  if [ -e "$STATE_DIR" ] && ! mv "$STATE_DIR" "$DISPLACED"; then
     log "could not set the existing state directory aside"
     return 1
   fi
-  if ! mv "$WORK/unpacked" "$STATE_DIR"; then
-    [ -d "$displaced" ] && mv "$displaced" "$STATE_DIR"
-    log "could not install the restored state directory"
+  if ! mv "$STAGING" "$STATE_DIR"; then
+    if [ -d "$DISPLACED" ] && [ ! -e "$STATE_DIR" ] && mv "$DISPLACED" "$STATE_DIR"; then
+      log "could not install the restored state; the previous one is back in place"
+    else
+      log "could not install the restored state; the previous one is at $DISPLACED — recover it"
+    fi
     return 1
   fi
-  rm -rf "$displaced"
+  rm -rf "$DISPLACED"
+}
 
+# Replace the local certbot state with the copy in Secrets Manager.
+#
+# Everything is validated in staging before anything on disk is touched, because restore replaces
+# the state directory wholesale and a truncated, wrong-shaped or hostile payload must not be able
+# to leave the host with neither the stored certificate nor the one it was already serving.
+restore() {
+  local outcome
+  if fetch_stored_payload "$WORK/payload.b64"; then
+    outcome="$RESTORE_OK"
+  else
+    outcome=$?
+  fi
+  [ "$outcome" -eq "$RESTORE_OK" ] || return "$outcome"
+  chmod 600 "$WORK/payload.b64"
+
+  # From here the payload exists but may be unusable. That is a definite, non-transient answer, so
+  # it reports ABSENT: the caller is free to fall back, including to ordering a certificate.
+  if [ ! -s "$WORK/payload.b64" ]; then
+    log "the stored certificate is empty"
+    return "$RESTORE_ABSENT"
+  fi
+  if ! base64 -d <"$WORK/payload.b64" >"$WORK/state.tar.gz" 2>/dev/null; then
+    log "the stored certificate is not valid base64"
+    return "$RESTORE_ABSENT"
+  fi
+  if ! archive_names_are_permitted; then
+    return "$RESTORE_ABSENT"
+  fi
+
+  # Ownership and modes come from THIS host, never from the archive.
+  rm -rf "$STAGING"
+  mkdir -p "$STAGING"
+  chmod 700 "$STAGING"
+  if ! tar -xzf "$WORK/state.tar.gz" -C "$STAGING" \
+    --no-same-owner --no-same-permissions --no-xattrs --no-acls 2>/dev/null; then
+    log "the stored certificate is not a readable gzipped tar"
+    return "$RESTORE_ABSENT"
+  fi
+  if ! staged_tree_is_contained; then
+    return "$RESTORE_ABSENT"
+  fi
+  if ! pem_pair_is_usable "$STAGING/live/$PEER_HOST"; then
+    log "the stored archive holds no usable certificate for $PEER_HOST"
+    return "$RESTORE_ABSENT"
+  fi
+
+  strip_renewal_hooks
+  chown -R root:root "$STAGING"
+  find "$STAGING" -type d -exec chmod 700 {} +
+  find "$STAGING" -type f -exec chmod 600 {} +
+
+  install_state || return "$RESTORE_FAILED"
+  apply_gateway_access
   log "restored the origin certificate from $SECRET_ID"
 }
 
@@ -141,14 +350,21 @@ restore() {
 
 # Publish the local certbot state so the next instance can restore it.
 #
+# Only the directories certbot owns go in, so the payload can never carry a hook, and the restore
+# side's allowlist has nothing legitimate to reject.
+#
 # The payload reaches the API as a file reference, never as an argument: anything on a command
-# line is readable by every process on the host through /proc, and this box is deliberately
-# internet-facing.
+# line is readable by every process on the host through /proc, and this box is internet-facing.
 save() {
   certificate_is_present ||
-    die "refusing to publish: there is no certificate at $LIVE_DIR"
+    die "refusing to publish: there is no usable certificate at $LIVE_DIR"
 
-  tar -czf "$WORK/state.tar.gz" -C "$STATE_DIR" .
+  local members=() dir
+  for dir in "${CERTBOT_STATE_DIRS[@]}"; do
+    [ -e "$STATE_DIR/$dir" ] && members+=("./$dir")
+  done
+
+  tar -czf "$WORK/state.tar.gz" -C "$STATE_DIR" "${members[@]}"
   base64 -w0 <"$WORK/state.tar.gz" >"$WORK/payload.b64"
   chmod 600 "$WORK/payload.b64"
 
@@ -180,13 +396,16 @@ save() {
 # without moving the files the gateway reads.
 issue() {
   log "no certificate available to restore; ordering one from Let's Encrypt" \
-      "(this consumes a rate-limited issuance)"
+    "(this consumes a rate-limited issuance)"
 
-  certbot certonly --dns-route53 --non-interactive --agree-tos \
-    --register-unsafely-without-email \
+  if ! certbot certonly --dns-route53 --non-interactive --agree-tos \
+    --register-unsafely-without-email --no-directory-hooks \
     --cert-name "$PEER_HOST" \
-    -d "$PEER_HOST" -d "$SAN_HOST"
+    -d "$PEER_HOST" -d "$SAN_HOST"; then
+    die "certbot could not obtain a certificate for $PEER_HOST"
+  fi
 
+  apply_gateway_access
   save
 }
 
@@ -200,14 +419,22 @@ issue() {
 renew() {
   local before after
   before="$(certificate_fingerprint)"
-  certbot renew --quiet --dns-route53
-  after="$(certificate_fingerprint)"
 
+  # Checked explicitly rather than left to `set -e`: when a caller invokes this function from an
+  # `if`, `set -e` is suspended for the whole body, and a silently-ignored certbot failure would
+  # then be read as "nothing was due".
+  if ! certbot renew --quiet --dns-route53 --no-directory-hooks; then
+    log "certbot renew failed"
+    return 1
+  fi
+
+  after="$(certificate_fingerprint)"
   if [ "$before" = "$after" ]; then
     log "nothing was due; the stored certificate is still current"
     return 0
   fi
 
+  apply_gateway_access
   save
   # certbot rewriting the file does nothing on its own — the gateway holds the certificate it
   # read at startup until it restarts. `try-restart` is a no-op when the gateway is not running,
@@ -218,26 +445,80 @@ renew() {
 
 # --- ensure ---------------------------------------------------------------------------------------
 
-# The boot path: end up with a serving certificate, contacting Let's Encrypt only when there is
-# no other way to get one.
-ensure() {
-  if restore && certificate_is_present; then
-    if certificate_is_fresh; then
-      log "the restored certificate is good for more than $RENEW_WITHIN_DAYS more days"
-      return 0
-    fi
-    log "the restored certificate expires within $RENEW_WITHIN_DAYS days; renewing it"
-    renew
+# A certificate was restored. Serve it, renewing first if it is near the end of its life.
+serve_restored() {
+  if certificate_is_fresh; then
+    log "the restored certificate is good for more than $RENEW_WITHIN_DAYS more days"
     return 0
   fi
 
+  log "the restored certificate expires within $RENEW_WITHIN_DAYS days; renewing it"
+  if renew; then
+    return 0
+  fi
+
+  # A renewal that fails at boot must not take the origin down while the certificate is still
+  # valid. There are up to RENEW_WITHIN_DAYS left and the timer retries twice a day, so a Route53
+  # or ACME hiccup costs nothing; refusing to serve would cost everything.
+  if certificate_is_valid_now; then
+    log "renewal failed, but the certificate is still valid ($(certificate_expiry));" \
+      "serving it and leaving the retry to certbot-renew.timer"
+    return 0
+  fi
+  die "the certificate has expired and renewal failed"
+}
+
+# Nothing is stored. Prefer a certificate this host already has: publishing one costs nothing,
+# ordering one costs a fifth of the weekly budget.
+adopt_or_issue() {
+  if certificate_is_present && certificate_is_valid_now; then
+    log "nothing is stored, but this host already holds a usable certificate; publishing it"
+    apply_gateway_access
+    save
+    return 0
+  fi
   issue
 }
 
+# The boot path: end up with a serving certificate, contacting Let's Encrypt only when this script
+# has positively established there is no other way to get one.
+ensure() {
+  local outcome
+  if restore; then
+    outcome="$RESTORE_OK"
+  else
+    outcome=$?
+  fi
+
+  case "$outcome" in
+  "$RESTORE_OK") serve_restored ;;
+  "$RESTORE_ABSENT") adopt_or_issue ;;
+  *)
+    # The stored state could not be read, so whether a certificate exists is UNKNOWN. Ordering
+    # here would be a guess, and a wrong guess spends one of five weekly issuances — the exact
+    # move that caused #2037. Serve what is on disk if it can serve, and otherwise stop.
+    if certificate_is_present && certificate_is_valid_now; then
+      log "could not read $SECRET_ID; serving the certificate already on this host"
+      apply_gateway_access
+      return 0
+    fi
+    die "could not read $SECRET_ID and no usable certificate is on disk;" \
+      "refusing to order one against an unknown state"
+    ;;
+  esac
+}
+
+# Is there a certificate the gateway can actually serve? The bootstrap gates on this before
+# enabling the gateway, so it must mean "parses and matches", not "the file is non-empty".
+check() {
+  certificate_is_present && certificate_is_valid_now
+}
+
 case "${1:-}" in
-  ensure)  ensure ;;
-  restore) restore ;;
-  save)    save ;;
-  renew)   renew ;;
-  *)       die "usage: dig-origin-cert {ensure|restore|save|renew}" ;;
+ensure) ensure ;;
+restore) restore ;;
+save) save ;;
+renew) renew ;;
+check) check ;;
+*) die "usage: dig-origin-cert {ensure|restore|save|renew|check}" ;;
 esac

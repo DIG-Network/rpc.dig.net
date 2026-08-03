@@ -133,6 +133,12 @@ mod behaviour {
     const SAN: &str = "rpc-origin.dig.net";
     const SECRET: &str = "rpc.dig.net/origin-cert";
 
+    /// The test user's own primary group — one it can `chgrp` to without being root.
+    fn current_group() -> String {
+        let out = Command::new("id").arg("-gn").output().expect("id -gn");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     /// A sandboxed installation of the helper: its own state directory, its own stored-secret
     /// file, and fakes for every external program it can reach.
     struct Sandbox {
@@ -177,6 +183,12 @@ mod behaviour {
 
         /// `aws` reduced to the two calls the helper makes, backed by a file on disk.
         ///
+        /// The failure messages matter as much as the successes. The real API reports "the secret
+        /// has no value yet" and "you may not read this secret" through *different* error codes,
+        /// and the helper is required to treat them differently — one may lead to an order, the
+        /// other must never. A stub that failed the same way for both would make
+        /// [`an_unreadable_secret_never_leads_to_an_order`] pass for the wrong reason.
+        ///
         /// It also records its full argument list, which is how
         /// [`the_private_key_is_never_passed_on_a_command_line`] can prove the key never reaches
         /// a process listing.
@@ -187,9 +199,16 @@ mod behaviour {
 printf '%s\n' "$*" >>"$SANDBOX/aws.log"
 for arg in "$@"; do
   case "$arg" in
-    get-secret-value) [ -s "$SANDBOX/stored-secret.b64" ] || exit 1
-                      cat "$SANDBOX/stored-secret.b64"; exit 0 ;;
-    put-secret-value) : ;;
+    get-secret-value)
+      if [ -f "$SANDBOX/aws-unreadable" ]; then
+        echo "An error occurred (AccessDeniedException) when calling the GetSecretValue operation: not authorized" >&2
+        exit 255
+      fi
+      if [ -s "$SANDBOX/stored-secret.b64" ]; then
+        cat "$SANDBOX/stored-secret.b64"; exit 0
+      fi
+      echo "An error occurred (ResourceNotFoundException) when calling the GetSecretValue operation: Secrets Manager can't find the specified secret value for staging label: AWSCURRENT" >&2
+      exit 254 ;;
   esac
 done
 case "$*" in
@@ -214,6 +233,7 @@ exit 0
                 "certbot",
                 r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >>"$SANDBOX/certbot.log"
+[ -f "$SANDBOX/certbot-fails" ] && exit 1
 case "$1" in
   certonly) "$SANDBOX/bin/make-cert" 90 ;;
   renew)    [ -f "$SANDBOX/renewal-is-due" ] && "$SANDBOX/bin/make-cert" 90 ;;
@@ -263,6 +283,45 @@ cp "$live/cert.pem" "$live/fullchain.pem"
             assert!(status.success(), "could not build the test certificate");
         }
 
+        /// Store a hand-built archive: a valid certificate for this host, plus whatever a test
+        /// wants to smuggle in alongside it. The certificate already on disk is left in place, so
+        /// a test can also assert the hostile payload did not displace it.
+        ///
+        /// This is the shape that matters for the secret's integrity: the payload is written by an
+        /// identity the node itself holds, so "it contains a valid certificate" is not evidence
+        /// that it is safe to unpack as root.
+        fn given_a_stored_archive_smuggling(&self, extra: &[(&str, &str)]) {
+            self.given_a_certificate_on_disk(90);
+
+            let hostile = self.path("hostile");
+            let _ = fs::remove_dir_all(&hostile);
+            let live = hostile.join("live").join(HOST);
+            fs::create_dir_all(&live).unwrap();
+            for name in ["cert.pem", "fullchain.pem", "privkey.pem"] {
+                fs::copy(
+                    self.state_dir().join("live").join(HOST).join(name),
+                    live.join(name),
+                )
+                .unwrap();
+            }
+            for (path, body) in extra {
+                let target = hostile.join(path);
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::write(&target, body).unwrap();
+            }
+
+            let packed = Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "tar -czf - -C '{}' . | base64 -w0 > '{}'",
+                    hostile.display(),
+                    self.stored_secret().display()
+                ))
+                .status()
+                .expect("packing the archive");
+            assert!(packed.success(), "could not build the test archive");
+        }
+
         /// Put a certificate valid for `days` into the *stored secret*, and leave the disk empty
         /// — the state a replacement instance boots into.
         fn given_a_certificate_only_in_the_secret(&self, days: u32) {
@@ -289,6 +348,11 @@ cp "$live/cert.pem" "$live/fullchain.pem"
                 .env("DIG_ORIGIN_CERT_HOST", HOST)
                 .env("DIG_ORIGIN_CERT_SAN", SAN)
                 .env("DIG_ORIGIN_CERT_STATE_DIR", self.state_dir())
+                .env("DIG_ORIGIN_CERT_RETRY_DELAY", "0")
+                // The helper grants the gateway's group read access to the certificate. Tests do
+                // not run as root, so point it at a group the test user is already in — the
+                // permission logic is still exercised, without needing to create a group.
+                .env("DIG_ORIGIN_CERT_GROUP", current_group())
                 .env("AWS_DEFAULT_REGION", "us-east-1")
                 .output()
                 .unwrap_or_else(|e| panic!("running {}: {e}", script.display()));
@@ -376,6 +440,95 @@ cp "$live/cert.pem" "$live/fullchain.pem"
         );
     }
 
+    /// **An unreadable secret is not an absent one.** Ordering must never happen on an unknown
+    /// state.
+    ///
+    /// A throttle, an `AccessDenied` while an IAM policy is still propagating, or a network blip
+    /// all make the read fail without saying anything about whether a certificate is stored.
+    /// Treating that as "nothing stored" spends one of five weekly issuances to re-obtain
+    /// something we already had — and five of those is another week of downtime.
+    #[test]
+    fn an_unreadable_secret_never_leads_to_an_order() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_only_in_the_secret(90);
+        sandbox.given_a_certificate_on_disk(90);
+        fs::write(sandbox.path("aws-unreadable"), "").unwrap();
+
+        sandbox.run("ensure").expect_success();
+
+        assert!(
+            sandbox.certbot_calls().is_empty(),
+            "an unreadable secret triggered an order: {}",
+            sandbox.certbot_calls()
+        );
+    }
+
+    /// The same rule with nothing to fall back on: stop, rather than guess.
+    ///
+    /// Refusing leaves the origin down until an operator looks, which is bad — but it is
+    /// recoverable in minutes with the issuance budget intact. Guessing wrong burns the budget and
+    /// is recoverable in a week.
+    #[test]
+    fn an_unreadable_secret_with_nothing_on_disk_stops_instead_of_ordering() {
+        let sandbox = Sandbox::new();
+        fs::write(sandbox.path("aws-unreadable"), "").unwrap();
+
+        sandbox.run("ensure").expect_failure();
+
+        assert!(
+            sandbox.certbot_calls().is_empty(),
+            "ordered a certificate against an unknown state: {}",
+            sandbox.certbot_calls()
+        );
+    }
+
+    /// A certificate already on this host is published, not re-bought.
+    ///
+    /// This is the first boot after the secret is created, and the state the host was left in by
+    /// the manual recovery on 2026-08-03: a perfectly good certificate on disk and an empty
+    /// secret. Ordering here would be paying for something already in hand.
+    #[test]
+    fn a_certificate_already_on_disk_is_published_rather_than_reordered() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_on_disk(90);
+
+        sandbox.run("ensure").expect_success();
+
+        assert!(
+            sandbox.certbot_calls().is_empty(),
+            "re-ordered a certificate the host already had: {}",
+            sandbox.certbot_calls()
+        );
+        assert!(
+            sandbox.secret_holds_a_certificate(),
+            "the existing certificate was not published, so the next boot would order one"
+        );
+    }
+
+    /// A renewal that fails at boot must not take the origin down.
+    ///
+    /// The certificate is inside the renewal window but still valid for weeks, and the timer
+    /// retries twice a day. Aborting the bootstrap over a Route53 or ACME hiccup would turn a
+    /// non-event into an outage — the same shape of failure as #2037 itself.
+    #[test]
+    fn a_failed_boot_renewal_still_serves_a_valid_certificate() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_only_in_the_secret(5);
+        fs::write(sandbox.path("certbot-fails"), "").unwrap();
+
+        sandbox.run("ensure").expect_success();
+
+        assert!(
+            sandbox.certbot_calls().contains("renew"),
+            "renewal was not even attempted: {}",
+            sandbox.certbot_calls()
+        );
+        assert!(
+            sandbox.certificate_on_disk().is_some(),
+            "a failed renewal discarded a certificate that was still valid"
+        );
+    }
+
     /// With nothing stored there is no alternative to issuing — but it must ask for BOTH names.
     ///
     /// The second name is not decoration. Let's Encrypt rate-limits duplicate certificates per
@@ -452,6 +605,160 @@ cp "$live/cert.pem" "$live/fullchain.pem"
             sandbox.certificate_on_disk().as_deref(),
             Some(before.as_slice()),
             "a corrupt payload destroyed the certificate the host was already serving"
+        );
+    }
+
+    /// **The secret is an input to a root-privileged unpack, so its integrity is a privilege
+    /// boundary.**
+    ///
+    /// The node's own role can write that secret. An attacker who reaches the unprivileged
+    /// `dignode` account — the identity behind the two internet-facing peer ports — can therefore
+    /// replace the payload with one that carries a real certificate *and* a certbot hook. certbot
+    /// runs those as root, at boot and twice daily. Worse, every future instance restores the same
+    /// payload, so tainting and replacing the box — the one remediation this stack has — would
+    /// re-infect it.
+    #[test]
+    fn an_archive_smuggling_a_certbot_hook_is_refused() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_stored_archive_smuggling(&[(
+            "renewal-hooks/pre/00-pwn.sh",
+            "#!/bin/sh\ntouch /tmp/pwned\n",
+        )]);
+        let before = sandbox
+            .certificate_on_disk()
+            .expect("a certificate to protect");
+
+        sandbox.run("restore").expect_failure();
+
+        assert_eq!(
+            sandbox.certificate_on_disk().as_deref(),
+            Some(before.as_slice()),
+            "a hostile archive displaced the certificate the host was serving"
+        );
+        assert!(
+            !sandbox.state_dir().join("renewal-hooks").exists(),
+            "a directory of root-executed hooks was installed from the stored payload"
+        );
+    }
+
+    /// The other half of the same vector: a hook recorded *inside* a renewal config.
+    ///
+    /// This archive is otherwise legitimate, so it restores — but `renew_hook` is a command
+    /// certbot runs as root, and it is not part of a certificate. It must not survive the trip.
+    #[test]
+    fn a_renewal_hook_recorded_in_the_config_is_stripped_on_restore() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_stored_archive_smuggling(&[(
+            &format!("renewal/{HOST}.conf"),
+            "version = 2.11.0\nrenew_hook = /bin/sh -c 'touch /tmp/pwned'\narchive_dir = /etc/letsencrypt/archive/x\n",
+        )]);
+
+        sandbox.run("restore").expect_success();
+
+        let installed = fs::read_to_string(
+            sandbox
+                .state_dir()
+                .join("renewal")
+                .join(format!("{HOST}.conf")),
+        )
+        .expect("the renewal config should have been restored");
+        assert!(
+            !installed.contains("renew_hook"),
+            "a root-executed hook survived into the installed renewal config:\n{installed}"
+        );
+        assert!(
+            installed.contains("archive_dir"),
+            "stripping hooks must not gut the rest of the config:\n{installed}"
+        );
+    }
+
+    /// certbot must never be allowed to run its hook directories, on either path.
+    ///
+    /// Stripping hooks out of the restored config closes one door; `/etc/letsencrypt/renewal-hooks`
+    /// is the other, and certbot reads it by default whatever the config says.
+    #[test]
+    fn certbot_is_never_allowed_to_run_directory_hooks() {
+        let sandbox = Sandbox::new();
+        sandbox.run("ensure").expect_success();
+        assert!(
+            sandbox.certbot_calls().contains("--no-directory-hooks"),
+            "issuing left directory hooks enabled: {}",
+            sandbox.certbot_calls()
+        );
+
+        let renewing = Sandbox::new();
+        renewing.given_a_certificate_on_disk(90);
+        renewing.run("renew").expect_success();
+        assert!(
+            renewing.certbot_calls().contains("--no-directory-hooks"),
+            "renewal left directory hooks enabled: {}",
+            renewing.certbot_calls()
+        );
+    }
+
+    /// "Non-empty" is not "a certificate", and the bootstrap gates the gateway on this answer.
+    ///
+    /// A one-byte `fullchain.pem` passes a `-s` test, so a payload that is merely *shaped* like a
+    /// certificate would be installed, pass the bootstrap's final check, and hand systemd a
+    /// gateway that exits at startup — reinstating the crash loop this change exists to remove.
+    #[test]
+    fn a_certificate_that_does_not_parse_is_not_treated_as_usable() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_on_disk(90);
+        let live = sandbox.state_dir().join("live").join(HOST);
+        fs::write(live.join("fullchain.pem"), "x").unwrap();
+
+        sandbox.run("check").expect_failure();
+    }
+
+    /// A key that parses but belongs to a different certificate is not a usable pair either.
+    #[test]
+    fn a_certificate_and_key_that_do_not_match_are_not_treated_as_usable() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_on_disk(90);
+        let live = sandbox.state_dir().join("live").join(HOST);
+        let stolen = sandbox.path("other-key.pem");
+        Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out '{}' 2>/dev/null",
+                stolen.display()
+            ))
+            .status()
+            .expect("generating an unrelated key");
+        fs::copy(&stolen, live.join("privkey.pem")).unwrap();
+
+        sandbox.run("check").expect_failure();
+    }
+
+    /// What we publish must not be able to carry a hook either — the allowlist on the way in is
+    /// only half of it, and a payload written by this host is the one every future host restores.
+    #[test]
+    fn publishing_never_includes_the_hook_directory() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_on_disk(90);
+        let hooks = sandbox.state_dir().join("renewal-hooks").join("deploy");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::write(hooks.join("leftover.sh"), "#!/bin/sh\n").unwrap();
+
+        sandbox.run("save").expect_success();
+
+        let listing = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "base64 -d < '{}' | tar -tzf -",
+                sandbox.stored_secret().display()
+            ))
+            .output()
+            .expect("listing the published archive");
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(
+            !listing.contains("renewal-hooks"),
+            "the published payload carries a hook directory:\n{listing}"
+        );
+        assert!(
+            listing.contains(&format!("live/{HOST}/fullchain.pem")),
+            "the published payload is missing the certificate:\n{listing}"
         );
     }
 

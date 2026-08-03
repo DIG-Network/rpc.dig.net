@@ -174,7 +174,11 @@ dnf install -y certbot python3-certbot-dns-route53
 # One place naming the certificate's inputs, read by both this bootstrap and the renewal timer, so
 # the two can never disagree about which secret or which hostnames are in play. Nothing here is
 # secret — these are identifiers, and the file is world-readable on purpose.
-cat >/etc/dig-origin-cert.env <<ENVFILE
+#
+# The heredoc is QUOTED: terraform substitutes these four values before the shell ever sees them,
+# so the shell has no reason to expand anything, and an unquoted heredoc would make a `$(…)` in any
+# operator-set variable execute as root at boot.
+cat >/etc/dig-origin-cert.env <<'ENVFILE'
 DIG_ORIGIN_CERT_SECRET=${origin_cert_secret}
 DIG_ORIGIN_CERT_HOST=${peer_host}
 DIG_ORIGIN_CERT_SAN=${origin_cert_san}
@@ -200,6 +204,15 @@ Description=Renew and publish the rpc.dig.net origin certificate
 Type=oneshot
 EnvironmentFile=/etc/dig-origin-cert.env
 ExecStart=/usr/local/sbin/dig-origin-cert renew
+
+# This unit runs as root twice a day and hands certbot a state directory restored from a secret
+# the node's own role can write. NoNewPrivileges means nothing reached from here can gain
+# privileges it was not started with, so a setuid binary that somehow landed in that directory is
+# inert. ProtectSystem is deliberately NOT set: certbot writes /etc/letsencrypt, /var/lib and
+# /var/log, and a too-narrow allowlist would break renewal silently, sixty days from now.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
 UNIT
 
 cat >/etc/systemd/system/certbot-renew.timer <<'UNIT'
@@ -265,13 +278,10 @@ set -a
 set +a
 /usr/local/sbin/dig-origin-cert ensure
 
-# The gateway runs unprivileged, so give it read access to the live cert without opening the whole
-# archive: the private keys of any OTHER cert on this host stay unreadable to it. Re-applied on
-# every boot because a restored archive carries whatever ownership it was packed with.
-groupadd -f certaccess
-usermod -aG certaccess dignode
-chgrp -R certaccess /etc/letsencrypt/live /etc/letsencrypt/archive
-chmod -R g+rX /etc/letsencrypt/live /etc/letsencrypt/archive
+# The certaccess group and the gateway's read access are applied by the helper itself, on every
+# path that changes the certificate — including the twice-daily renewal, which this bootstrap
+# never sees. Doing it here as well would be a second copy that only runs at boot, and the two
+# would drift the first time certbot renewed.
 
 systemctl daemon-reload
 systemctl enable --now dig-capsules.service
@@ -285,8 +295,9 @@ systemctl enable --now certbot-renew.timer
 # the bootstrap even logged that the gateway would "start WITHOUT TLS", a mode that has never
 # existed. Fail the bootstrap instead, and leave the unit installed so an operator who fixes the
 # certificate can start it by hand.
-if [ -s "/etc/letsencrypt/live/${peer_host}/fullchain.pem" ] &&
-   [ -s "/etc/letsencrypt/live/${peer_host}/privkey.pem" ]; then
+# `check` parses the certificate and the key and confirms they belong together. A `-s` test would
+# not: a one-byte fullchain.pem is non-empty, passes, and hands systemd the crash loop.
+if /usr/local/sbin/dig-origin-cert check; then
   systemctl enable --now rpc-gateway.service
 else
   echo "FATAL: no origin certificate at /etc/letsencrypt/live/${peer_host}." >&2

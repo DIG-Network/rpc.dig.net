@@ -83,10 +83,22 @@ resource "aws_iam_role_policy" "certbot_dns01" {
 # Scoped to that ONE secret ARN — not a prefix, not a wildcard. The instance can read and replace
 # its own certificate and has no visibility into any other secret in the account.
 #
-# The write grant is the deliberate part. Renewal happens ON this host, so the host is necessarily
-# what publishes the renewed certificate; nothing else is in a position to. The residual risk is a
-# compromised instance overwriting its own certificate with rubbish, which costs a re-issue rather
-# than a disclosure — the private key it would be replacing is already on that instance's disk.
+# THE WRITE GRANT IS THE LOAD-BEARING RISK, AND IT IS NOT MERELY A DISCLOSURE ONE. Renewal happens
+# ON this host, so the host is necessarily what publishes the renewed certificate; nothing else is
+# in a position to. But that makes the secret an INPUT to a root-privileged unpack on this and
+# every future instance. An attacker who reaches the unprivileged `dignode` account can reach the
+# instance role, rewrite the payload, and have it restored as root at the next boot — surviving the
+# instance replacement that would otherwise be the remediation.
+#
+# What keeps that from being an escalation is on the consuming side, in dig-origin-cert.sh: the
+# archive may contain only certbot's own state directories, no hooks, no setuid bits, no symlink
+# leaving the tree; ownership and modes are imposed by the host rather than taken from the archive;
+# `*_hook` lines are stripped from restored renewal configs; and certbot is run with
+# `--no-directory-hooks`. Weakening any of those turns this grant into root on every future node.
+#
+# Still open (dig_ecosystem#2039): the secret uses the AWS-managed key with no resource policy, so
+# any account principal holding `secretsmanager:GetSecretValue` can read the private key AND the
+# ACME account key — enough to revoke the live certificate, not just impersonate the origin.
 data "aws_iam_policy_document" "origin_cert_secret" {
   statement {
     sid    = "ReadAndWriteTheOriginCertificate"

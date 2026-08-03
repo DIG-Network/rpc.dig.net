@@ -1,0 +1,16 @@
+# Anything that ends up executing on the node host MUST be stored with LF.
+#
+# This is not cosmetic. `infra/user_data.sh.tftpl` was committed with CRLF, so terraform rendered
+# CRLF into user_data and the instance received a shell script whose every line ended `\r`. It has
+# worked only because cloud-init happens to normalise the payload before running it — the copy at
+# /var/lib/cloud/instance/user-data.txt is 252 bytes larger than the scripts/part-001 it actually
+# executes, one byte per line. Nothing documents that behaviour as a contract.
+#
+# It is more than a latent risk now: user_data writes infra/dig-origin-cert.sh to
+# /usr/local/sbin/dig-origin-cert, and systemd runs THAT file directly, twice a day, with no
+# cloud-init anywhere in the path to clean it up. `bash` rejects `wait_for_state_device() {\r`
+# outright, which is how this was found — the rendered-bootstrap test parses what the instance
+# runs, and CRLF does not parse.
+*.sh     text eol=lf
+*.tftpl  text eol=lf
+*.tf     text eol=lf
