@@ -45,12 +45,18 @@ locals {
     gateway_sha256   = var.gateway_sha256
     peer_host        = var.peer_host
 
-    # The certificate helper is injected as a value rather than written inline, so it stays a real
-    # file the test suite and shellcheck can reach. Its own shell expansions are then invisible to
-    # templatefile, which would otherwise try to interpolate every shell parameter expansion.
-    origin_cert_script = file("${path.module}/dig-origin-cert.sh")
-    origin_cert_secret = data.aws_secretsmanager_secret.origin_cert.arn
-    origin_cert_san    = var.origin_cert_san_host
+    # The certificate helper is FETCHED, not embedded. It used to be spliced into this template,
+    # which was fine until its comments pushed the rendered bootstrap past EC2's 16 KiB user-data
+    # ceiling (the precondition below caught it). It now arrives like the two binaries do —
+    # downloaded and SHA-256-verified on the host — which is the mechanism this file already
+    # trusts for code it runs as root.
+    #
+    # The digest is taken from the repo file rather than passed in by the workflow, so it is by
+    # construction the digest of the exact bytes that were uploaded from this same checkout.
+    origin_cert_script_url    = var.origin_cert_script_url
+    origin_cert_script_sha256 = filesha256("${path.module}/dig-origin-cert.sh")
+    origin_cert_secret        = data.aws_secretsmanager_secret.origin_cert.arn
+    origin_cert_san           = var.origin_cert_san_host
   })
 
   bootstrap_encoded = base64gzip(local.bootstrap)

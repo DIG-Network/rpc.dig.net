@@ -1075,19 +1075,14 @@ cp "$live/cert.pem" "$live/fullchain.pem"
         );
     }
 
-    /// The bootstrap exactly as an instance receives it: every Terraform placeholder filled in and
-    /// the helper injected into its heredoc.
+    /// The bootstrap exactly as an instance receives it: every Terraform placeholder filled in.
     ///
     /// Both the syntax check and the size check need this, and they need it to be *faithful* — a
     /// render that leaves placeholders in measures a script shorter than the real one and parses a
     /// script that is not the one that boots.
     fn render_bootstrap() -> String {
-        // Substitute the scalars and check for leftovers BEFORE injecting the helper. The helper is
-        // full of legitimate `${...}` shell expansions, so once it is in there is no way left to
-        // tell a shell expansion from a Terraform placeholder nobody substituted.
-        //
-        // Values are representative in LENGTH, not just in shape, because the size check below
-        // depends on them.
+        // Values are representative in LENGTH, not just in shape, because the size check depends
+        // on them.
         let substitutions = [
             ("cache_root", "/var/lib/dig-node/cache"),
             ("capsule_bucket", "dig-rpc-node-capsules"),
@@ -1117,29 +1112,33 @@ cp "$live/cert.pem" "$live/fullchain.pem"
                 "arn:aws:secretsmanager:us-east-1:000000000000:secret:rpc.dig.net/origin-cert-XXXXXX",
             ),
             ("origin_cert_san", "rpc-origin.dig.net"),
+            (
+                "origin_cert_script_url",
+                "https://github.com/DIG-Network/rpc.dig.net/releases/download/v0.84.0/dig-origin-cert.sh",
+            ),
+            (
+                "origin_cert_script_sha256",
+                "1f0e8a4c9b7d2e5306af41bc8d97e2530f6a4b18c27d93e05a1fb6c48d0937ae",
+            ),
         ];
 
         let mut rendered = user_data();
         for (name, value) in substitutions {
             rendered = rendered.replace(&format!("${{{name}}}"), value);
         }
-        assert_eq!(
-            rendered.matches("${").count(),
-            1,
-            "the only placeholder left should be ${{origin_cert_script}}; an unsubstituted \
-             Terraform variable means this renders a different script than the instance runs — add \
-             it to the list above"
+        assert!(
+            !rendered.contains("${"),
+            "an unsubstituted Terraform variable means this renders a different script than the \
+             instance runs — add it to the list above"
         );
-
-        rendered.replace("${origin_cert_script}", &read("infra/dig-origin-cert.sh"))
+        rendered
     }
 
-    /// The bootstrap embeds the helper in a heredoc, so a rendered template — not the template —
-    /// is what the instance runs. Parse the rendered form.
+    /// A rendered template — not the template — is what the instance runs. Parse the rendered form.
     ///
-    /// This is the only place the two files are combined, and a broken combination is invisible
-    /// until an instance boots: cloud-init would run a mangled script, the gateway would never
-    /// start, and the failure would surface as an outage rather than as a red build.
+    /// A broken render is invisible until an instance boots: cloud-init would run a mangled script,
+    /// the gateway would never start, and the failure would surface as an outage rather than as a
+    /// red build.
     #[test]
     fn the_rendered_bootstrap_is_valid_bash() {
         let rendered = render_bootstrap();
@@ -1197,18 +1196,65 @@ cp "$live/cert.pem" "$live/fullchain.pem"
         );
     }
 
-    /// The helper must survive being carried through a heredoc unchanged.
-    ///
-    /// A line in the helper equal to the heredoc terminator would truncate it mid-script, and the
-    /// instance would install a half-written file that still looks plausible.
+    /// The helper is fetched over the network and run as root, so it must be checksum-verified —
+    /// by the same routine the two binaries go through, not by a bare `curl`.
     #[test]
-    fn the_helper_cannot_terminate_the_heredoc_that_carries_it() {
-        let helper = read("infra/dig-origin-cert.sh");
+    fn the_helper_is_installed_only_after_its_checksum_is_verified() {
+        let bootstrap = user_data();
+        let install = bootstrap
+            .lines()
+            .find(|line| {
+                line.trim_start().starts_with("install_verified")
+                    && line.contains("dig-origin-cert")
+            })
+            .expect("the bootstrap must install the helper through install_verified");
         assert!(
-            !helper
-                .lines()
-                .any(|line| line.trim_end() == "ORIGIN_CERT_SCRIPT"),
-            "a line in the helper matches the heredoc terminator and would truncate it"
+            install.contains("${origin_cert_script_url}")
+                && install.contains("${origin_cert_script_sha256}"),
+            "the helper must be fetched by URL and verified against a pinned digest: {install}"
+        );
+        assert!(
+            !bootstrap.contains("curl -fsSL -o /usr/local/sbin/dig-origin-cert"),
+            "the helper must not be fetched outside install_verified"
+        );
+    }
+
+    /// The helper must be LF, and this is now load-bearing rather than tidy.
+    ///
+    /// While it was embedded in user_data it passed through cloud-init, which silently normalises
+    /// CRLF — that is the only reason a CRLF template ever booted. Fetched byte-for-byte, nothing
+    /// normalises it, and `bash` will not parse `wait_for_state_device() {\r`.
+    #[test]
+    fn the_helper_is_stored_with_unix_line_endings() {
+        let raw = std::fs::read(repo_root().join("infra/dig-origin-cert.sh")).expect("helper");
+        assert!(
+            !raw.contains(&b'\r'),
+            "the helper contains CR bytes; systemd runs this file directly, with no cloud-init to \
+             normalise it"
+        );
+    }
+
+    /// The helper is shipped as a release asset, so the deploy must actually publish it — and must
+    /// confirm it resolves BEFORE terraform replaces the instance.
+    #[test]
+    fn the_deploy_publishes_and_verifies_the_helper_asset() {
+        let deploy = read(".github/workflows/deploy.yml");
+        assert!(
+            deploy.contains("infra/dig-origin-cert.sh"),
+            "deploy.yml must upload the helper as a release asset"
+        );
+        let upload = deploy.find("gh release upload").expect("an upload step");
+        let apply = deploy
+            .find("terraform -chdir=infra apply")
+            .expect("an apply step");
+        let verify = deploy
+            .find("asset reachable at")
+            .expect("a reachability check");
+        assert!(
+            upload < verify && verify < apply,
+            "the asset must be uploaded and confirmed reachable BEFORE the apply that replaces the \
+             instance — otherwise a missing asset is discovered by a host that has already been \
+             replaced"
         );
     }
 

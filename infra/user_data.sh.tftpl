@@ -186,13 +186,17 @@ AWS_DEFAULT_REGION=${region}
 ENVFILE
 chmod 0644 /etc/dig-origin-cert.env
 
-# Installed verbatim from infra/dig-origin-cert.sh, so the certificate logic is a reviewable,
-# shellcheck-able, unit-tested file rather than shell buried in a Terraform template. That it was
-# NOT testable is why #2037 shipped.
-cat >/usr/local/sbin/dig-origin-cert <<'ORIGIN_CERT_SCRIPT'
-${origin_cert_script}
-ORIGIN_CERT_SCRIPT
-chmod 0755 /usr/local/sbin/dig-origin-cert
+# infra/dig-origin-cert.sh, byte-for-byte, checksum-verified before it is installed — the same
+# treatment the two binaries get, because systemd executes this file as root twice a day.
+#
+# It is fetched rather than embedded for a mundane reason: EC2 caps user data at 16 KiB, and the
+# helper plus the comments that explain it does not fit. Keeping the comments and moving the file
+# was the better trade — this is the script someone reads during an outage.
+#
+# Byte-for-byte matters more than it looks. Embedded, the helper passed through cloud-init, which
+# silently normalises CRLF; fetched, it does not. `.gitattributes` pins the repo file to LF and a
+# test asserts it, because `bash` will not parse `wait_for_state_device() {\r`.
+install_verified "${origin_cert_script_url}" "${origin_cert_script_sha256}" /usr/local/sbin/dig-origin-cert
 
 # Renewal. The helper publishes a renewed certificate back to the durable copy and restarts the
 # gateway, but only when something actually changed — see dig-origin-cert.sh.

@@ -41,6 +41,19 @@ variable "origin_cert_san_host" {
   default     = "rpc-origin.dig.net"
 }
 
+variable "origin_cert_script_url" {
+  description = <<-EOT
+    HTTPS URL of infra/dig-origin-cert.sh, published as a release asset by the deploy workflow from
+    the same checkout terraform is applying.
+
+    Only the URL is supplied; the SHA-256 is computed from the repo file with `filesha256`, so the
+    digest the host verifies against cannot drift from the bytes that were uploaded. The workflow
+    confirms the URL resolves BEFORE apply, so a missing asset fails the deploy rather than the
+    boot of an already-replaced instance.
+  EOT
+  type        = string
+}
+
 variable "origin_cert_secret_name" {
   description = "Secrets Manager secret holding the origin certificate + certbot state, as a base64 gzipped tar. Read, never created, by this stack — see origin_cert.tf for why the certificate deliberately outlives the stack."
   type        = string
