@@ -1183,10 +1183,18 @@ cp "$live/cert.pem" "$live/fullchain.pem"
 
     /// The renewal timer runs twice a day. Publishing unconditionally would write a new secret
     /// version and bounce the gateway every time, for months, with nothing having changed.
+    ///
+    /// "Nothing has changed" now means the durable copy already matches what is being served, not
+    /// merely that certbot renewed nothing — so the precondition has to be an IN-SYNC secret. With
+    /// an empty one, republishing is the correct behaviour and this test would be asserting the
+    /// bug.
     #[test]
     fn renewal_publishes_only_when_the_certificate_actually_changed() {
         let sandbox = Sandbox::new();
         sandbox.given_a_certificate_on_disk(90);
+        sandbox.run("save").expect_success();
+        fs::write(sandbox.path("aws.log"), "").unwrap();
+        fs::write(sandbox.path("systemctl.log"), "").unwrap();
 
         sandbox.run("renew").expect_success();
         assert!(
