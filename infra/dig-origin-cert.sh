@@ -297,10 +297,19 @@ staged_tree_is_contained() {
 # predict it. Dropping is deliberate over rejecting: an unknown key cannot execute anything once it
 # is gone, whereas refusing the payload would strand a replacement with no certificate.
 #
-# Fails CLOSED. If the parser is unavailable or a config will not parse, the payload is refused
-# rather than installed unexamined.
+# FAILS CLOSED, IN THE RIGHT DIRECTION. The two failures here are not the same kind and must not
+# be answered the same way. "This config will not parse" is a fact about the PAYLOAD, so it reports
+# ABSENT and the caller may fall back to ordering. "configobj is not installed" is a fact about the
+# HOST — it says nothing about whether a certificate is stored — so it reports FAILED, because
+# routing it to ABSENT would mean a missing python package silently buys a new certificate on every
+# replacement until the weekly limit is gone. That is Rule 1 at the top of this file, and the first
+# version of this function broke it.
+#
+# Exit 2 from the helper means environment; any other non-zero means payload.
 sanitize_renewal_configs() {
-  python3 - "$STAGING/renewal" <<'PYTHON' || return 1
+  # `-I` isolates the interpreter: without it `python3 -` puts the CWD on sys.path, so a
+  # `configobj.py` sitting in the working directory would be imported instead of the system one.
+  python3 -I - "$STAGING/renewal" <<'PYTHON'
 import os
 import re
 import shutil
@@ -309,8 +318,9 @@ import sys
 try:
     from configobj import ConfigObj
 except ImportError:
+    # Exit 2: the HOST is broken, not the payload. See the comment above the function.
     print("configobj is unavailable, so a renewal config cannot be examined", file=sys.stderr)
-    raise SystemExit(1)
+    raise SystemExit(2)
 
 renewal_dir = sys.argv[1]
 if not os.path.isdir(renewal_dir):
@@ -320,8 +330,11 @@ if not os.path.isdir(renewal_dir):
 # renewal needs, and dropping it is always safe.
 TOP_LEVEL = {"version", "archive_dir", "cert", "privkey", "chain", "fullchain"}
 RENEWAL_PARAMS = {
-    "account", "authenticator", "installer", "server", "key_type", "elliptic_curve",
+    "account", "authenticator", "server", "key_type", "elliptic_curve",
     "rsa_key_size", "must_staple", "reuse_key", "dns_route53_propagation_seconds",
+    # `installer` is deliberately ABSENT. It is the only key certbot writes that names a code path
+    # to load, and this deployment always records `installer = None`, so dropping it costs nothing
+    # and removes an attacker-chosen plugin name from the restored config.
 }
 CONFIG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.conf$")
 
@@ -333,7 +346,10 @@ for name in sorted(os.listdir(renewal_dir)):
     # A name certbot would never read is a name that exists to hide something. Note certbot's own
     # glob skips dot-files, so `.evil.conf` would sit on disk unexamined by any name-based filter.
     if os.path.islink(path) or not os.path.isfile(path) or not CONFIG_NAME.match(name):
-        shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else os.remove(path)
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
         dropped.append("file %s" % name)
         continue
 
@@ -364,8 +380,10 @@ for name in sorted(os.listdir(renewal_dir)):
 
     config.write()
 
+# These names came out of an attacker-controllable file and are about to be logged. Strip anything
+# that is not printable ASCII so a crafted key cannot forge log lines with CR or terminal escapes.
 for item in dropped:
-    print(item)
+    print(re.sub(r"[^ -~]", "?", item))
 PYTHON
 }
 
@@ -447,9 +465,14 @@ restore() {
     return "$RESTORE_ABSENT"
   fi
 
-  local dropped
-  if ! dropped="$(sanitize_renewal_configs)"; then
-    log "the stored archive holds a renewal config that cannot be examined"
+  local dropped sanitize_status
+  dropped="$(sanitize_renewal_configs)" && sanitize_status=0 || sanitize_status=$?
+  if [ "$sanitize_status" -eq 2 ]; then
+    log "cannot examine a renewal config on this host; refusing to judge the stored payload"
+    return "$RESTORE_FAILED"
+  fi
+  if [ "$sanitize_status" -ne 0 ]; then
+    log "the stored archive holds a renewal config that cannot be parsed"
     return "$RESTORE_ABSENT"
   fi
   if [ -n "$dropped" ]; then

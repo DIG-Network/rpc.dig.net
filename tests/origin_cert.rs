@@ -798,6 +798,29 @@ cp "$live/cert.pem" "$live/fullchain.pem"
         );
     }
 
+    /// **A broken parser is a fact about the host, not about the payload.**
+    ///
+    /// The first version of the sanitizer answered "configobj is not installed" the same way it
+    /// answered "this config is malformed" — both routed to ABSENT, the branch that may order from
+    /// Let's Encrypt. So a missing python package would have quietly bought a new certificate on
+    /// every replacement until the weekly limit was gone: the exact failure this whole change
+    /// exists to prevent, reintroduced by the fix for something else.
+    #[test]
+    fn a_host_that_cannot_examine_a_config_never_leads_to_an_order() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_only_in_the_secret(90);
+        // Stand in for a host where `import configobj` fails: the helper exits 2 for environment.
+        sandbox.write_executable("python3", "#!/usr/bin/env bash\nexit 2\n");
+
+        sandbox.run("ensure").expect_failure();
+
+        assert!(
+            sandbox.certbot_calls().is_empty(),
+            "a host that could not examine the payload ordered a certificate anyway: {}",
+            sandbox.certbot_calls()
+        );
+    }
+
     /// A special file has no business in certbot state, and unlike the setuid case tar really does
     /// extract one — so this guard is genuinely reachable and worth holding.
     #[test]
