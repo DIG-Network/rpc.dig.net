@@ -178,7 +178,7 @@ The node's capsule cache is **backed by S3 and read-only to the node**.
 ### 5.1 Layout
 
 ```
-<DIG_NODE_CACHE>/modules/{store_hex}/{root_hex}.module    <- Mountpoint for S3, READ-ONLY
+<DIG_NODE_CACHE>/modules/{store_hex}/{root_hex}.dig    <- Mountpoint for S3, READ-ONLY
 <DIG_NODE_CACHE>/downloads/                               <- local EBS
 <DIG_NODE_CACHE>/responses/                               <- local EBS
 <DIG_NODE_CACHE>/peer-net/                                <- local EBS
@@ -228,12 +228,15 @@ LRU-evicted (dig-node `SPEC.md` §6).
 The hub's publish path is the **only** writer. It MUST write one object per published capsule:
 
 ```
-s3://<capsule bucket>/{store_hex}/{root_hex}.module
+s3://<capsule bucket>/{store_hex}/{root_hex}.dig
 ```
 
 - `store_hex` and `root_hex` are lowercase hex, no `0x`.
-- The suffix MUST be `.module`, matching dig-node's `module_path`. The hub's own bucket uses
-  `.dig`; these are separate objects in separate buckets with separate lifecycles.
+- The suffix MUST be `.dig` — the canonical capsule artifact extension ecosystem-wide, and the same
+  suffix dig-node's `module_path` writes. The hub's own bucket uses `.dig` too; these remain separate
+  objects in separate buckets with separate lifecycles, but they no longer differ in shape.
+- A reader MAY tolerate a legacy `.module` object written by an older binary, but a writer MUST NOT
+  create one. The live bucket was migrated to `.dig` on 2026-08-02 and holds no `.module` objects.
 - Objects are content-addressed and immutable. A writer MUST NOT overwrite an existing key with
   different bytes.
 

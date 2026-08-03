@@ -5,7 +5,7 @@
 # Why this is a SEPARATE bucket from the hub's `dighub-modules`:
 #   1. The live retrieval Lambda reads `dighub-modules` right now. Not touching it means this
 #      work cannot break the read tier that is currently serving.
-#   2. Objects here are keyed `{store_hex}/{root_hex}.module` to match dig-node's `module_path`
+#   2. Objects here are keyed `{store_hex}/{root_hex}.dig` to match dig-node's `module_path`
 #      (dig-node-core lib.rs:760-763); the hub's are `.dig`. Two suffixes, two lifecycles.
 #   3. It gives the boundary a real edge: the node's role is read-only here, the hub's publish
 #      role is write-only. A shared prefix could not express that.

@@ -26,7 +26,7 @@ variable "zone_name" {
 }
 
 variable "capsule_bucket" {
-  description = "S3 bucket mounted READ-ONLY at <cache>/modules. Holds one object per published capsule, keyed {store_hex}/{root_hex}.module to match dig-node's module_path layout."
+  description = "S3 bucket mounted READ-ONLY at <cache>/modules. Holds one object per published capsule, keyed {store_hex}/{root_hex}.dig to match dig-node's module_path layout."
   type        = string
   default     = "dig-rpc-node-capsules"
 }
