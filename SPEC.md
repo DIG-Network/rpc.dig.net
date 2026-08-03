@@ -266,10 +266,28 @@ exist for the peer host.
 |---|---|---|
 | `GATEWAY_LISTEN` | `0.0.0.0:8080` | gateway bind address |
 | `DIG_NODE_URL` | `http://127.0.0.1:9778` | the wrapped node; MUST be loopback |
+| `GATEWAY_TLS_CERT` | — | PEM certificate chain served on the origin hop |
+| `GATEWAY_TLS_KEY` | — | PEM private key for that chain |
 | `RUST_LOG` | `info` | log filter |
 
 `DIG_NODE_URL` MUST point at loopback. Pointing it at a remote node would send unauthenticated
 read traffic across a network the gateway does not control.
+
+### 7.1 Origin TLS
+
+The origin hop MUST be TLS. Not for the payload's sake — capsule bytes are already ciphertext with
+merkle proofs — but because the request path names the capsule being read, and in the clear that
+discloses to any on-path observer which capsule each READER is fetching.
+
+When `GATEWAY_TLS_CERT`/`GATEWAY_TLS_KEY` name a keypair the gateway cannot read and parse, the
+gateway MUST exit non-zero at startup. **There is no plaintext fallback mode**, and no deployment
+may describe one: an operator told the service is running without TLS will look in the wrong place,
+which is exactly how dig_ecosystem#2037 stayed misdiagnosed while the read tier was down.
+
+A deployment MUST be able to replace the host that serves this certificate without obtaining a new
+one. Certificate authorities rate-limit issuance, so a deployment that re-issues per replacement
+makes routine redeployment consume a scarce external resource and can lock itself out of its own
+origin.
 
 ---
 

@@ -66,19 +66,29 @@ jobs:
           echo "sha=$SHA" >>"$GITHUB_OUTPUT"
           echo "gateway sha256=$SHA"
 
-      - name: publish the binary as a release asset
+      - name: publish the release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ vars.DIG_NODE_VERSION }}
         run: |
           set -euo pipefail
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
-          gh release upload "$TAG" rpc-gateway-aarch64 --clobber
-          # Confirm the asset resolves at the EXACT url user_data will curl. An upload that
-          # "succeeded" under the wrong name is otherwise invisible until the host 404s at boot.
-          URL="https://github.com/${{ github.repository }}/releases/download/$TAG/rpc-gateway-aarch64"
-          curl -fsSL -o /dev/null "$URL"
-          echo "asset reachable at $URL"
+
+          # dig-origin-cert.sh ships as an asset rather than inside user_data, because EC2 caps
+          # user data at 16 KiB and the helper plus its comments does not fit — see the size
+          # precondition in infra/node.tf. It is fetched and SHA-256-verified on the host by the
+          # same install_verified the two binaries go through.
+          gh release upload "$TAG" rpc-gateway-aarch64 infra/dig-origin-cert.sh --clobber
+
+          # Confirm each asset resolves at the EXACT url user_data will curl, BEFORE terraform runs.
+          # An upload that "succeeded" under the wrong name is otherwise invisible until the host
+          # 404s at boot — and by then the instance has already been replaced. Failing here costs a
+          # workflow run; failing there costs the origin.
+          for ASSET in rpc-gateway-aarch64 dig-origin-cert.sh; do
+            URL="https://github.com/${{ github.repository }}/releases/download/$TAG/$ASSET"
+            curl -fsSL -o /dev/null "$URL"
+            echo "asset reachable at $URL"
+          done
 
       - uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
         with:
@@ -100,10 +110,11 @@ jobs:
           TAG: ${{ vars.DIG_NODE_VERSION }}
         run: |
           set -euo pipefail
-          GATEWAY_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/rpc-gateway-aarch64"
+          BASE="https://github.com/${{ github.repository }}/releases/download/$TAG"
           terraform -chdir=infra apply -auto-approve -input=false \
-            -var="gateway_artifact_url=$GATEWAY_URL" \
+            -var="gateway_artifact_url=$BASE/rpc-gateway-aarch64" \
             -var="gateway_sha256=${{ steps.art.outputs.sha }}" \
+            -var="origin_cert_script_url=$BASE/dig-origin-cert.sh" \
             -var="dig_node_version=${{ vars.DIG_NODE_VERSION }}" \
             -var="dig_node_artifact_url=${{ vars.DIG_NODE_ARTIFACT_URL }}" \
             -var="dig_node_sha256=${{ vars.DIG_NODE_SHA256 }}"

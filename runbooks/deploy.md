@@ -27,6 +27,20 @@ merge to main -> release.yml cuts vX.Y.Z -> deploy.yml:
 | secret | `RELEASE_TOKEN` | PAT that pushes the changelog commit + tag |
 | environment | `production` | gates the apply |
 
+### Required AWS pre-requisite: the origin-certificate secret
+
+The stack **reads** a Secrets Manager secret named `rpc.dig.net/origin-cert` and never creates it.
+A plan fails with `couldn't find resource` if it is missing. Bootstrapping a fresh environment:
+
+```bash
+aws secretsmanager create-secret --name rpc.dig.net/origin-cert \
+  --description "Origin certificate + certbot state for node-rpc.dig.net"
+```
+
+Leave it empty. The first boot finds nothing to restore, orders a certificate, and publishes it;
+every boot after that restores. See "The certificate outlives the instance" below for why this is
+deliberately outside terraform's ownership.
+
 `DIG_NODE_*` are repo variables rather than terraform defaults on purpose: the running node
 version is an operational decision, it is visible in the workflow run, and it can be rolled back
 without a code change.
@@ -67,6 +81,92 @@ volume and trips its `prevent_destroy`. If you ever see *"Resource aws_ebs_volum
 lifecycle.prevent_destroy set, but the plan calls for this resource to be destroyed"*, something has
 re-coupled the volume to the instance. Do not disable `prevent_destroy` to get past it — that guard
 is the peer identity's last line of defence. Break the coupling instead.
+
+### The certificate outlives the instance
+
+A replacement must be **cheap**, and for a while it was not. The origin certificate used to live
+only on the instance's disk, so every replacement bought a new one from Let's Encrypt instead of
+reusing one. On 2026-08-03 the sixth replacement in a day hit the five-per-week limit for that
+identifier set and the read tier was down for ~21 hours with no way to self-recover
+(dig_ecosystem#2037). An instance replacement had quietly become an operation that consumes a
+rate-limited external resource, and nothing said so.
+
+The certificate now lives in Secrets Manager and the instance is the cache:
+
+```
+boot -> dig-origin-cert ensure
+          restore from rpc.dig.net/origin-cert
+            fresh?      -> done, Let's Encrypt is never contacted
+            near expiry -> certbot renew -> publish -> restart the gateway
+          nothing stored -> certbot certonly -> publish
+```
+
+`/usr/local/sbin/dig-origin-cert` is installed verbatim from `infra/dig-origin-cert.sh`, and
+`certbot-renew.timer` runs it twice daily.
+
+**Editing the helper replaces the instance — including a comment-only edit.** Its SHA-256 is pinned
+into `user_data` by `filesha256`, and `user_data_replace_on_change = true`, so any byte that changes
+in `infra/dig-origin-cert.sh` changes `user_data` and recycles the node. That is correct — the host
+must run the version that was reviewed — but it means a typo fix in a comment costs a replacement.
+Batch helper edits rather than trickling them.
+
+**A publish failure is degraded, not down.** If `put-secret-value` fails, the host keeps serving and
+logs a `WARNING` naming the cost: the durable copy still holds the previous certificate, so the next
+replacement restores that, renews, and spends a rate-limited issuance — every time, until write
+access is fixed. `grep WARNING` in the cloud-init log or the certbot-renew journal is how you find
+it; there is no alarm yet.
+
+**Two things must not be "tidied up".**
+
+- The certificate carries a second name, `rpc-origin.dig.net`, with no DNS record. Let's Encrypt
+  rate-limits per **exact set of identifiers**, and the single-name set is the one that was
+  exhausted. Removing the second name puts issuance back on the burnt bucket.
+- `data.aws_secretsmanager_secret.origin_cert` is a data source, not a resource. Terraform
+  replaces the instance routinely; if it also owned the certificate, a taint or a destroy could
+  take it, and re-creating one is not free.
+
+**Diagnosing a certificate problem**
+
+```bash
+# what the host has, how long it is good for, and WHICH certificate it is
+certbot certificates | grep -E 'Certificate Name|Serial Number|Domains|Expiry'
+
+# what is stored (metadata only — never print the value, it contains the private key
+# and the ACME account key)
+aws secretsmanager describe-secret --secret-id rpc.dig.net/origin-cert
+
+# how many generations this host has ever held — one file per issuance
+ls /etc/letsencrypt/archive/node-rpc.dig.net/
+```
+
+**To prove a replacement did not issue, compare the SERIAL NUMBER, not a certificate count.** A
+restored instance serves the *same* serial; one that ordered serves a new one. Three signals should
+agree, and they are all local:
+
+| signal | restored | re-issued |
+|---|---|---|
+| `certbot certificates` serial | unchanged | new |
+| `/etc/letsencrypt/archive/…/` | `cert1.pem` only | `cert2.pem` appears |
+| cloud-init log | `restored the origin certificate from …` | `ordering one from Let's Encrypt` |
+
+A fourth: the secret's `VersionId` only changes when the host publishes, so a pure restore leaves it
+alone.
+
+crt.sh is the cross-check against Let's Encrypt itself rather than against our own records, but it
+is not always reachable — it returned `502 Bad Gateway` throughout the #2037 recovery. Do not let a
+verification plan depend on it:
+
+```bash
+curl -s -H 'User-Agent: dig-loop/1.0' 'https://crt.sh/?q=%25.dig.net&output=json' \
+  | jq -r '.[] | "\(.not_before) \(.name_value)"' | sort -u
+```
+
+Certificates appear twice there (pre-certificate and certificate); de-duplicate before counting
+against the limit of five.
+
+If the limit is ever exhausted again, the restore path means a replacement no longer needs an
+issuance at all — check the secret is populated before assuming otherwise. Adding another name to
+the set is the escape hatch, not the first move.
 
 ### Changing a setting safely
 

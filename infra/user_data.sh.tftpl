@@ -73,7 +73,9 @@ grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' >>/etc/fus
 install_verified() {
   local url="$1" sha="$2" dest="$3" tmp
   tmp="$(mktemp)"
-  curl -fsSL -o "$tmp" "$url"
+  # --retry because this now fetches the certificate helper as well as the two binaries, and a
+  # transient blip at boot would leave a replaced instance with no way to serve.
+  curl -fsSL --retry 3 --retry-connrefused --retry-delay 2 -o "$tmp" "$url"
   echo "$sha  $tmp" | sha256sum -c -
   install -m 0755 -o root -g root "$tmp" "$dest"
   rm -f "$tmp"
@@ -147,7 +149,7 @@ ReadWritePaths=$CACHE_ROOT /var/lib/dig-node
 WantedBy=multi-user.target
 UNIT
 
-# --- Origin TLS certificate (#1951) -------------------------------------------------------------
+# --- Origin TLS certificate (#1951, made durable in #2037) --------------------------------------
 # CloudFront reaches this box over the public internet, so the origin hop must not be plaintext.
 # Not for the payload's sake — DIG content is already ciphertext + merkle proofs — but because the
 # request path carries /stores/{store_id}/content/{retrieval_key}. In the clear that tells any
@@ -160,36 +162,63 @@ UNIT
 # ~$16/mo, roughly doubling this node's cost, against an explicit cheapest-configuration
 # requirement.
 #
-# KNOWN DEBT: renewal is a certbot timer on this box. If it silently fails the origin cert expires
-# and the read tier 502s 90 days later, far from whatever broke it. There is no expiry alarm yet —
-# accepted deliberately at this stage (#1951), and the exit is the NLB + wildcard.
+# THE CERTIFICATE IS NOT AN INSTANCE-LOCAL FILE (#2037). It used to be, and because Terraform
+# replaces this instance on every deploy, every deploy bought a NEW certificate instead of reusing
+# one. Six replacements in a day exhausted Let's Encrypt's five-per-week limit and took the read
+# tier down for ~21 hours. The durable copy now lives in Secrets Manager and this bootstrap
+# RESTORES it; `dig-origin-cert` contacts Let's Encrypt only to issue a first certificate or to
+# renew an ageing one. A replacement costs nothing.
 #
 # DNS-01, not HTTP-01: no extra port opens on a box already internet-facing on two peer ports, and
 # the account already runs Route53 for this zone.
 dnf install -y certbot python3-certbot-dns-route53
 
-CERT_DIR=/etc/letsencrypt/live/${peer_host}
-if ! certbot certonly --dns-route53 --non-interactive --agree-tos       --register-unsafely-without-email       -d "${peer_host}" --cert-name "${peer_host}"; then
-  echo "certbot failed — the gateway will start WITHOUT TLS and CloudFront (https-only) cannot reach it" >&2
-fi
+# One place naming the certificate's inputs, read by both this bootstrap and the renewal timer, so
+# the two can never disagree about which secret or which hostnames are in play. Nothing here is
+# secret — these are identifiers, and the file is world-readable on purpose.
+#
+# The heredoc is QUOTED: terraform substitutes these four values before the shell ever sees them,
+# so the shell has no reason to expand anything on the way in. Writing the file is only half of it
+# — see how it is read back below, which is where the expansion would actually have happened.
+cat >/etc/dig-origin-cert.env <<'ENVFILE'
+DIG_ORIGIN_CERT_SECRET=${origin_cert_secret}
+DIG_ORIGIN_CERT_HOST=${peer_host}
+DIG_ORIGIN_CERT_SAN=${origin_cert_san}
+AWS_DEFAULT_REGION=${region}
+ENVFILE
+chmod 0644 /etc/dig-origin-cert.env
 
-# The gateway runs unprivileged, so give it read access to the live cert without opening the whole
-# archive: the private keys of any OTHER cert on this host stay unreadable to it.
-groupadd -f certaccess
-usermod -aG certaccess dignode
-chgrp -R certaccess /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
-chmod -R g+rX /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+# infra/dig-origin-cert.sh, byte-for-byte, checksum-verified before it is installed — the same
+# treatment the two binaries get, because systemd executes this file as root twice a day.
+#
+# It is fetched rather than embedded for a mundane reason: EC2 caps user data at 16 KiB, and the
+# helper plus the comments that explain it does not fit. Keeping the comments and moving the file
+# was the better trade — this is the script someone reads during an outage.
+#
+# Byte-for-byte matters more than it looks. Embedded, the helper passed through cloud-init, which
+# silently normalises CRLF; fetched, it does not. `.gitattributes` pins the repo file to LF and a
+# test asserts it, because `bash` will not parse `wait_for_state_device() {\r`.
+install_verified "${origin_cert_script_url}" "${origin_cert_script_sha256}" /usr/local/sbin/dig-origin-cert
 
-# Renewal, plus a gateway restart so a renewed cert is actually SERVED — certbot rewriting the file
-# does nothing on its own, the process holds the old one until it reloads.
+# Renewal. The helper publishes a renewed certificate back to the durable copy and restarts the
+# gateway, but only when something actually changed — see dig-origin-cert.sh.
 cat >/etc/systemd/system/certbot-renew.service <<'UNIT'
 [Unit]
-Description=Renew the rpc.dig.net origin certificate
+Description=Renew and publish the rpc.dig.net origin certificate
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/certbot renew --quiet --dns-route53
-ExecStartPost=/bin/systemctl try-restart rpc-gateway.service
+EnvironmentFile=/etc/dig-origin-cert.env
+ExecStart=/usr/local/sbin/dig-origin-cert renew
+
+# This unit runs as root twice a day and hands certbot a state directory restored from a secret
+# the node's own role can write. NoNewPrivileges means nothing reached from here can gain
+# privileges it was not started with, so a setuid binary that somehow landed in that directory is
+# inert. ProtectSystem is deliberately NOT set: certbot writes /etc/letsencrypt, /var/lib and
+# /var/log, and a too-narrow allowlist would break renewal silently, sixty days from now.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
 UNIT
 
 cat >/etc/systemd/system/certbot-renew.timer <<'UNIT'
@@ -245,8 +274,44 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 WantedBy=multi-user.target
 UNIT
 
+# --- Obtain the certificate ---------------------------------------------------------------------
+# Runs AFTER every unit file exists, because a renewal triggered here restarts the gateway and
+# `systemctl try-restart` needs the unit to be known. Restores from Secrets Manager if it can;
+# orders from Let's Encrypt only if it cannot.
+# Read as key=value pairs, NOT sourced. `. file` runs the file as a shell script, so a `$(…)` in
+# any of those values would execute here as root — and systemd's own `EnvironmentFile=`, which the
+# renewal timer uses, does not do that. Quoting the heredoc above stops nothing on this path; this
+# does. The values are operator-set tfvars rather than attacker input, so this is closing the
+# mechanism rather than a live hole.
+while IFS='=' read -r key value; do
+  case "$key" in DIG_ORIGIN_CERT_* | AWS_DEFAULT_REGION) export "$key=$value" ;; esac
+done </etc/dig-origin-cert.env
+/usr/local/sbin/dig-origin-cert ensure
+
+# The certaccess group and the gateway's read access are applied by the helper itself, on every
+# path that changes the certificate — including the twice-daily renewal, which this bootstrap
+# never sees. Doing it here as well would be a second copy that only runs at boot, and the two
+# would drift the first time certbot renewed.
+
 systemctl daemon-reload
 systemctl enable --now dig-capsules.service
 systemctl enable --now dig-node.service
 systemctl enable --now certbot-renew.timer
-systemctl enable --now rpc-gateway.service
+
+# --- The gateway starts only with a certificate -------------------------------------------------
+# The gateway reads its certificate at startup and EXITS if it is not there, so enabling it
+# without one buys a restart loop: `systemctl status` reports "activating", which reads as
+# starting up, while the origin is in fact dead. That is precisely how #2037 stayed misdiagnosed —
+# the bootstrap even logged that the gateway would "start WITHOUT TLS", a mode that has never
+# existed. Fail the bootstrap instead, and leave the unit installed so an operator who fixes the
+# certificate can start it by hand.
+# `check` parses the certificate and the key and confirms they belong together. A `-s` test would
+# not: a one-byte fullchain.pem is non-empty, passes, and hands systemd the crash loop.
+if /usr/local/sbin/dig-origin-cert check; then
+  systemctl enable --now rpc-gateway.service
+else
+  echo "FATAL: no origin certificate at /etc/letsencrypt/live/${peer_host}." >&2
+  echo "The gateway is NOT being started: it cannot serve without one, and a crash loop would" >&2
+  echo "misreport a dead origin as a starting one. rpc.dig.net is DOWN until this is resolved." >&2
+  exit 1
+fi
