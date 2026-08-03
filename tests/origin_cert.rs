@@ -135,7 +135,16 @@ mod behaviour {
 
     /// The test user's own primary group — one it can `chgrp` to without being root.
     fn current_group() -> String {
-        let out = Command::new("id").arg("-gn").output().expect("id -gn");
+        id_field("-gn")
+    }
+
+    /// `user:group` for the test user — an ownership it can `chown` to without being root.
+    fn current_owner() -> String {
+        format!("{}:{}", id_field("-un"), current_group())
+    }
+
+    fn id_field(flag: &str) -> String {
+        let out = Command::new("id").arg(flag).output().expect("id");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -353,6 +362,9 @@ cp "$live/cert.pem" "$live/fullchain.pem"
                 // not run as root, so point it at a group the test user is already in — the
                 // permission logic is still exercised, without needing to create a group.
                 .env("DIG_ORIGIN_CERT_GROUP", current_group())
+                // Restore imposes ownership on the state it installs rather than trusting the
+                // archive's. Tests are not root, so they name themselves.
+                .env("DIG_ORIGIN_CERT_OWNER", current_owner())
                 .env("AWS_DEFAULT_REGION", "us-east-1")
                 .output()
                 .unwrap_or_else(|e| panic!("running {}: {e}", script.display()));

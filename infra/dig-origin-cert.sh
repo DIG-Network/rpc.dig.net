@@ -59,6 +59,10 @@ readonly LIVE_DIR="$STATE_DIR/live/$PEER_HOST"
 # Overridable only so the tests can name a group they already belong to; production never sets it.
 readonly CERT_GROUP="${DIG_ORIGIN_CERT_GROUP:-certaccess}"
 
+# Ownership imposed on restored state, replacing whatever the archive claimed. Overridable for the
+# same reason: the tests are not root and cannot chown to it. Production never sets it.
+readonly STATE_OWNER="${DIG_ORIGIN_CERT_OWNER:-root:root}"
+
 # The only top-level entries certbot owns, and therefore the only ones the payload may carry.
 # `renewal-hooks/` is deliberately absent: its whole purpose is to hold scripts certbot executes
 # as root, which is exactly what an attacker who can write the secret would put there.
@@ -337,7 +341,7 @@ restore() {
   fi
 
   strip_renewal_hooks
-  chown -R root:root "$STAGING"
+  chown -R "$STATE_OWNER" "$STAGING"
   find "$STAGING" -type d -exec chmod 700 {} +
   find "$STAGING" -type f -exec chmod 600 {} +
 
