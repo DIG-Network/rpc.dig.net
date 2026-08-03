@@ -4,7 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.2.3] - 2026-08-03
+## [0.2.5] - 2026-08-03
+
+### Bug Fixes
+- **infra:** Persist the origin certificate so a replacement never re-issues (#10)- **infra:** Contain the peek tree, not just check the file type (#12)
+
+## [0.84.0] - 2026-08-03
+
+### Bug Fixes
+- **deploy:** Use DIG_NODE_VERSION variable instead of github.ref_name for release tag
+
+## [0.2.4] - 2026-08-03
 
 ### Documentation
 - **spec:** The capsule object suffix is .dig, not .module (#9)
