@@ -232,7 +232,7 @@ fetch_stored_payload() {
 # tar cannot make: that the archive contains ONLY certbot's own state. A payload that also carried
 # `renewal-hooks/pre/x.sh` would look like a certificate and execute as root at the next renewal.
 archive_names_are_permitted() {
-  local member top
+  local tarball="$1" member top
   while IFS= read -r member; do
     member="${member#./}"
     [ -n "$member" ] && [ "$member" != "." ] || continue
@@ -252,7 +252,7 @@ archive_names_are_permitted() {
       return 1
       ;;
     esac
-  done < <(tar -tf "$WORK/state.tar")
+  done < <(tar -tf "$tarball")
 }
 
 # Nothing in the unpacked tree escapes it, and nothing in it can escalate.
@@ -483,7 +483,7 @@ restore() {
     log "the stored certificate expands past the $MAX_DECOMPRESSED_BYTES byte ceiling"
     return "$RESTORE_ABSENT"
   fi
-  if ! archive_names_are_permitted; then
+  if ! archive_names_are_permitted "$WORK/state.tar"; then
     return "$RESTORE_ABSENT"
   fi
 
@@ -630,8 +630,19 @@ stored_certificate_fingerprint() {
   base64 -d <"$WORK/peek.b64" >"$WORK/peek.tar.gz" 2>/dev/null || return 1
   gzip -dc "$WORK/peek.tar.gz" 2>/dev/null |
     head -c "$((MAX_DECOMPRESSED_BYTES + 1))" >"$WORK/peek.tar" || true
-  tar -xf "$WORK/peek.tar" -C "$peek" --no-same-owner --no-same-permissions     "./live/$PEER_HOST/cert.pem" 2>/dev/null || return 1
+  # The WHOLE tree, not just `live/$PEER_HOST/cert.pem`. On real certbot state that path is a
+  # relative symlink into `archive/`, so extracting it alone yields a dangling link, `openssl`
+  # fails, and this function can only ever fail — which silently turns the reconciliation it exists
+  # for into "republish on every timer run, forever". The fixtures hid it by writing regular files
+  # into `live/`; certbot does not.
+  #
+  # Same member-name guard as `restore`, because this unpacks an attacker-influenceable archive —
+  # into $WORK rather than /etc, but unchecked extraction is not a habit worth having. Size is
+  # already bounded by the decompression ceiling above.
+  archive_names_are_permitted "$WORK/peek.tar" || return 1
+  tar -xf "$WORK/peek.tar" -C "$peek" --no-same-owner --no-same-permissions 2>/dev/null || return 1
 
+  [ -f "$peek/live/$PEER_HOST/cert.pem" ] || return 1
   openssl x509 -in "$peek/live/$PEER_HOST/cert.pem" -noout -fingerprint -sha256 2>/dev/null
 }
 

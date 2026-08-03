@@ -273,20 +273,35 @@ exit 0
             );
         }
 
-        /// Writes a self-signed certificate into the sandbox state directory, laid out the way
-        /// certbot lays one out. `$1` is the number of days it stays valid, so a test can produce
-        /// both a comfortably-fresh certificate and one inside the renewal window.
+        /// Writes a self-signed certificate into the sandbox, laid out the way certbot actually
+        /// lays one out: the real PEMs live in `archive/<host>/*1.pem` and `live/<host>/*.pem` are
+        /// RELATIVE SYMLINKS at them.
+        ///
+        /// The symlinks are not decoration. An earlier fixture wrote regular files into `live/`,
+        /// and that single simplification hid a real defect: `stored_certificate_fingerprint`
+        /// extracted only `live/<host>/cert.pem`, which on a real host is a dangling link without
+        /// its target, so the function could only ever fail and the reconciliation it exists for
+        /// silently degraded into "republish on every timer run". A fixture that cannot express the
+        /// production layout cannot fail on a bug that only exists there.
+        ///
+        /// `$1` is the number of days it stays valid, so a test can produce both a comfortably
+        /// fresh certificate and one inside the renewal window.
         fn install_cert_writer(&self) {
             self.write_executable(
                 "make-cert",
                 r#"#!/usr/bin/env bash
 set -e
 live="$SANDBOX/state/live/node-rpc.dig.net"
-mkdir -p "$live" "$SANDBOX/state/renewal" "$SANDBOX/state/accounts"
+arch="$SANDBOX/state/archive/node-rpc.dig.net"
+mkdir -p "$live" "$arch" "$SANDBOX/state/renewal" "$SANDBOX/state/accounts"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -days "$1" -subj "/CN=node-rpc.dig.net" \
-  -keyout "$live/privkey.pem" -out "$live/cert.pem" 2>/dev/null
-cp "$live/cert.pem" "$live/fullchain.pem"
+  -keyout "$arch/privkey1.pem" -out "$arch/cert1.pem" 2>/dev/null
+cp "$arch/cert1.pem" "$arch/fullchain1.pem"
+cp "$arch/cert1.pem" "$arch/chain1.pem"
+for f in cert privkey fullchain chain; do
+  ln -sf "../../archive/node-rpc.dig.net/${f}1.pem" "$live/$f.pem"
+done
 : >"$SANDBOX/state/renewal/node-rpc.dig.net.conf"
 "#,
             );
