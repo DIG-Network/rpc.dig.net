@@ -31,6 +31,34 @@ locals {
   cache_cap_unbounded = "18446744073709551615"
 
   cache_root = "/var/lib/dig-node/cache"
+
+  bootstrap = templatefile("${path.module}/user_data.sh.tftpl", {
+    capsule_bucket   = aws_s3_bucket.capsules.id
+    region           = var.region
+    cache_root       = local.cache_root
+    cache_cap        = local.cache_cap_unbounded
+    gateway_port     = var.gateway_port
+    dig_node_version = var.dig_node_version
+    dig_node_url     = var.dig_node_artifact_url
+    dig_node_sha256  = var.dig_node_sha256
+    gateway_url      = var.gateway_artifact_url
+    gateway_sha256   = var.gateway_sha256
+    peer_host        = var.peer_host
+
+    # The certificate helper is injected as a value rather than written inline, so it stays a real
+    # file the test suite and shellcheck can reach. Its own shell expansions are then invisible to
+    # templatefile, which would otherwise try to interpolate every shell parameter expansion.
+    origin_cert_script = file("${path.module}/dig-origin-cert.sh")
+    origin_cert_secret = data.aws_secretsmanager_secret.origin_cert.arn
+    origin_cert_san    = var.origin_cert_san_host
+  })
+
+  bootstrap_encoded = base64gzip(local.bootstrap)
+
+  # EC2's user-data ceiling is 16 KiB of the bytes it is handed — the COMPRESSED bytes here, since
+  # cloud-init decompresses on the instance. base64 inflates by 4/3, so the budget is expressed in
+  # the units `base64gzip` returns.
+  bootstrap_encoded_limit = 16384 * 4 / 3
 }
 
 # Fail the plan with a readable message rather than a RunInstances error part-way through an apply.
@@ -67,30 +95,29 @@ resource "aws_instance" "node" {
   }
 
   user_data_replace_on_change = true
-  user_data = templatefile("${path.module}/user_data.sh.tftpl", {
-    capsule_bucket   = aws_s3_bucket.capsules.id
-    region           = var.region
-    cache_root       = local.cache_root
-    cache_cap        = local.cache_cap_unbounded
-    gateway_port     = var.gateway_port
-    dig_node_version = var.dig_node_version
-    dig_node_url     = var.dig_node_artifact_url
-    dig_node_sha256  = var.dig_node_sha256
-    gateway_url      = var.gateway_artifact_url
-    gateway_sha256   = var.gateway_sha256
-    peer_host        = var.peer_host
-  })
 
-  tags = {
-    Name    = "rpc-dig-net-node"
-    role    = "public-gateway-node"
-    purpose = "rpc.dig.net read tier + public peer"
-  }
+  # COMPRESSED, and not as an optimisation. EC2 caps user data at 16 KiB and the bootstrap renders
+  # to ~24 KiB, so an uncompressed apply is rejected outright — with the entire script quoted back
+  # at you in the error, which is how this was found. cloud-init sniffs the gzip magic bytes and
+  # decompresses before running, so the cap effectively applies to the compressed size (~8.9 KiB,
+  # comfortably inside it). The precondition below keeps that headroom honest.
+  user_data_base64 = local.bootstrap_encoded
 
   lifecycle {
     # The AMI parameter moves whenever AL2023 publishes; that alone should not recycle a serving
     # node. Replace deliberately, by tainting, not as a side effect of an unrelated apply.
     ignore_changes = [ami]
+
+    precondition {
+      condition     = length(local.bootstrap_encoded) <= local.bootstrap_encoded_limit
+      error_message = "The bootstrap no longer fits in EC2's 16 KiB user-data limit even compressed. Move the long tail of it out of user_data (an S3-hosted script fetched at boot) rather than deleting the comments that explain why the code is the way it is."
+    }
+  }
+
+  tags = {
+    Name    = "rpc-dig-net-node"
+    role    = "public-gateway-node"
+    purpose = "rpc.dig.net read tier + public peer"
   }
 
   depends_on = [aws_s3_bucket_policy.capsules]

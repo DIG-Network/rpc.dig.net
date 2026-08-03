@@ -78,6 +78,34 @@ resource "aws_iam_role_policy" "certbot_dns01" {
   policy = data.aws_iam_policy_document.certbot_dns01.json
 }
 
+# The durable origin certificate (#2037): read it at boot, write it back after a renewal.
+#
+# Scoped to that ONE secret ARN — not a prefix, not a wildcard. The instance can read and replace
+# its own certificate and has no visibility into any other secret in the account.
+#
+# The write grant is the deliberate part. Renewal happens ON this host, so the host is necessarily
+# what publishes the renewed certificate; nothing else is in a position to. The residual risk is a
+# compromised instance overwriting its own certificate with rubbish, which costs a re-issue rather
+# than a disclosure — the private key it would be replacing is already on that instance's disk.
+data "aws_iam_policy_document" "origin_cert_secret" {
+  statement {
+    sid    = "ReadAndWriteTheOriginCertificate"
+    effect = "Allow"
+    actions = [
+      "secretsmanager:DescribeSecret",
+      "secretsmanager:GetSecretValue",
+      "secretsmanager:PutSecretValue",
+    ]
+    resources = [data.aws_secretsmanager_secret.origin_cert.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "origin_cert_secret" {
+  name   = "origin-cert-secret"
+  role   = aws_iam_role.node.id
+  policy = data.aws_iam_policy_document.origin_cert_secret.json
+}
+
 # SSM Session Manager instead of SSH. No port 22 in the security group, no key pair, no bastion —
 # one fewer remotely-reachable service on a host that is deliberately internet-facing.
 resource "aws_iam_role_policy_attachment" "ssm" {

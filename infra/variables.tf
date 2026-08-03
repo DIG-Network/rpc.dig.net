@@ -25,6 +25,28 @@ variable "zone_name" {
   default     = "dig.net"
 }
 
+variable "origin_cert_san_host" {
+  description = <<-EOT
+    Second name on the origin certificate. It has no DNS record and needs none — dns-01 validates
+    against the hosted zone, not against a reachable host.
+
+    Its job is the rate-limit bucket. Let's Encrypt caps duplicate certificates per EXACT set of
+    identifiers, and dig_ecosystem#2037 exhausted the single-name set {node-rpc.dig.net} for a
+    week while the read tier was down. Ordering {node-rpc.dig.net, rpc-origin.dig.net} is a
+    distinct set with its own budget.
+
+    Do NOT remove this as an unused name: dropping it moves issuance back onto the exhausted set.
+  EOT
+  type        = string
+  default     = "rpc-origin.dig.net"
+}
+
+variable "origin_cert_secret_name" {
+  description = "Secrets Manager secret holding the origin certificate + certbot state, as a base64 gzipped tar. Read, never created, by this stack — see origin_cert.tf for why the certificate deliberately outlives the stack."
+  type        = string
+  default     = "rpc.dig.net/origin-cert"
+}
+
 variable "capsule_bucket" {
   description = "S3 bucket mounted READ-ONLY at <cache>/modules. Holds one object per published capsule, keyed {store_hex}/{root_hex}.dig to match dig-node's module_path layout."
   type        = string

@@ -74,3 +74,42 @@ touched the network); an allowed call returns `-32603` (tried to forward, failed
 two codes distinguish "short-circuited" from "forwarded", so `an_allowed_method_is_forwarded_to_the_node`
 is what stops every other test in the file from passing vacuously. Without it, a gateway that
 denied *everything* would look fully correct.
+
+## An instance replacement can consume a rate-limited external resource
+
+`user_data_replace_on_change = true` plus a binary SHA in `user_data` means every release replaces
+the EC2 instance. That was a deliberate, well-documented choice, and the cost was understood to be
+"a few minutes of downtime". It was not. The origin certificate was obtained by `certbot certonly`
+*in user_data*, so a replacement did not reuse a certificate — it **bought** one. Six replacements
+in a day exhausted Let's Encrypt's five-per-week limit for the exact identifier set, and because
+the gateway reads its certificate at startup and exits without one, the read tier was hard down for
+~21 hours (dig_ecosystem#2037).
+
+The generalisable lesson is not "cache the certificate". It is that **immutable-infrastructure
+redeployment silently changes cost when anything in the boot path talks to a rate-limited external
+service.** Before making a resource replace-on-change, enumerate what its boot path *acquires* —
+certificates, registrations, licences, API-key provisioning, an identity the network has to learn —
+and make each of those durable. The peer-identity EBS volume in this stack is the same lesson,
+already learned once for `peer_id`; the certificate was the second instance of it and was missed.
+
+Two smaller things worth keeping:
+
+- **Let's Encrypt's duplicate-certificate limit is keyed on the EXACT identifier set.** Adding a
+  second name to the request creates a distinct set with its own budget, and dns-01 means the extra
+  name needs no A record — only that the zone exists. That is the emergency escape hatch when a set
+  is exhausted, and it buys five more, so it is only viable together with making issuance rare.
+- **Persist certbot's whole state directory, not the two PEM files.** Restoring only
+  `fullchain.pem` and `privkey.pem` serves traffic today and then silently stops renewing, because
+  certbot needs its `renewal/` config, its `archive/`, and its ACME account. That failure surfaces
+  ~60 days later, nowhere near its cause.
+
+## user_data is capped at 16 KiB, and the error is unreadable
+
+Embedding a well-commented helper script pushed the rendered bootstrap to ~24 KiB and the apply was
+rejected with `expected length of user_data to be in the range (0 - 16384), got` followed by the
+entire script. The fix is `base64gzip` into `user_data_base64` — cloud-init sniffs the gzip magic
+bytes and decompresses before running — which took ~24 KiB to ~8.9 KiB.
+
+The limit therefore applies to the *compressed* bytes, which is a lot of headroom, but it is
+invisible until an apply. The guard belongs at PR time, not deploy time: a test gzips the rendered
+template and asserts the size, so the failure is a review comment instead of a red deploy.
