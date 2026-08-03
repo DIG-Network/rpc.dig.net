@@ -590,6 +590,15 @@ save() {
     return 1
   fi
 
+  # This ceiling is a SLOW FUSE and the failure at the end of it is quiet: certbot keeps every
+  # generation in archive/, so the payload grows a little at each renewal, and the run that finally
+  # exceeds the ceiling does not break anything visibly — it just stops publishing, leaving the
+  # durable copy stale and every later replacement spending an issuance. Years from now, with no
+  # signal. Say something while there is still room to act.
+  if [ "$((encoded_bytes * 100 / MAX_ENCODED_BYTES))" -ge 70 ]; then
+    log "NOTE: the certbot state is $encoded_bytes of $MAX_ENCODED_BYTES bytes. It grows one"       "certificate generation per renewal; when it crosses the ceiling, publishing stops and the"       "durable copy silently goes stale. Prune old generations from archive/ (dig_ecosystem#2055)."
+  fi
+
   local attempt
   for attempt in 1 2 3; do
     if aws secretsmanager put-secret-value \
