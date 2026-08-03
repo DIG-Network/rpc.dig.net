@@ -222,6 +222,10 @@ for arg in "$@"; do
 done
 case "$*" in
   *put-secret-value*)
+    if [ -f "$SANDBOX/aws-put-fails" ]; then
+      echo "An error occurred (AccessDeniedException) when calling the PutSecretValue operation" >&2
+      exit 255
+    fi
     for arg in "$@"; do
       case "$arg" in file://*) cp "${arg#file://}" "$SANDBOX/stored-secret.b64" ;; esac
     done
@@ -419,6 +423,11 @@ cp "$live/cert.pem" "$live/fullchain.pem"
                 String::from_utf8_lossy(&self.output.stderr)
             );
             self
+        }
+
+        /// The helper logs to stderr; several tests assert on what it said, not only on its code.
+        fn stderr(&self) -> String {
+            String::from_utf8_lossy(&self.output.stderr).into_owned()
         }
 
         fn expect_failure(self) -> Run {
@@ -795,6 +804,85 @@ cp "$live/cert.pem" "$live/fullchain.pem"
             sandbox.certificate_on_disk().as_deref(),
             Some(before.as_slice()),
             "an escaping archive displaced the serving certificate"
+        );
+    }
+
+    /// **`save` must never report a success it did not achieve.**
+    ///
+    /// It is called from inside `renew`, which callers invoke from an `if` — and `set -e` is
+    /// suspended for the whole nested body of a function called in a condition. So an unchecked
+    /// `aws put-secret-value` fails, falls through, and reaches the "published" log anyway. That is
+    /// not a cosmetic lie: the durable copy keeps the OLD certificate, so every later replacement
+    /// restores the stale one, renews, and spends an issuance — #2037 again, behind a log line
+    /// asserting it cannot happen.
+    #[test]
+    fn a_failed_publish_is_reported_as_a_failure() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_on_disk(90);
+        fs::write(sandbox.path("aws-put-fails"), "").unwrap();
+
+        let run = sandbox.run("save").expect_failure();
+
+        assert!(
+            !run.stderr().contains("published the origin certificate"),
+            "save claimed to publish while the API call failed:\n{}",
+            run.stderr()
+        );
+        assert!(
+            !sandbox.secret_holds_a_certificate(),
+            "nothing should have been stored"
+        );
+    }
+
+    /// A publish failure during renewal must be loud, and must NOT take the origin down.
+    ///
+    /// The certificate is valid and the gateway should serve it; refusing would turn a degraded
+    /// durable copy into an outage. But the deferred cost is real, so the warning has to name it
+    /// rather than say "could not publish" and leave the reader to work it out.
+    #[test]
+    fn a_failed_publish_during_renewal_still_serves_and_says_what_it_costs() {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_on_disk(90);
+        fs::write(sandbox.path("renewal-is-due"), "").unwrap();
+        fs::write(sandbox.path("aws-put-fails"), "").unwrap();
+
+        let run = sandbox.run("renew").expect_success();
+
+        assert!(
+            run.stderr().contains("WARNING") && run.stderr().contains("replacement"),
+            "a failed publish must name the consequence, not just the error:\n{}",
+            run.stderr()
+        );
+        assert!(
+            sandbox.log("systemctl.log").contains("rpc-gateway"),
+            "the renewed certificate should still be served"
+        );
+    }
+
+    /// The same failure on the issue path must be answered the same way.
+    ///
+    /// This was inconsistent: a publish failure after issuing aborted the bootstrap, which is the
+    /// one path that ends with a perfectly usable certificate on disk and the origin down anyway.
+    #[test]
+    fn a_failed_publish_after_issuing_still_brings_the_origin_up() {
+        let sandbox = Sandbox::new();
+        fs::write(sandbox.path("aws-put-fails"), "").unwrap();
+
+        let run = sandbox.run("ensure").expect_success();
+
+        assert!(
+            sandbox.certbot_calls().contains("certonly"),
+            "the test needs the issue path: {}",
+            sandbox.certbot_calls()
+        );
+        assert!(
+            run.stderr().contains("WARNING"),
+            "an unstored certificate must be reported:\n{}",
+            run.stderr()
+        );
+        assert!(
+            sandbox.certificate_on_disk().is_some(),
+            "the issued certificate should be on disk and serving"
         );
     }
 

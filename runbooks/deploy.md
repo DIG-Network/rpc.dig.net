@@ -104,6 +104,18 @@ boot -> dig-origin-cert ensure
 `/usr/local/sbin/dig-origin-cert` is installed verbatim from `infra/dig-origin-cert.sh`, and
 `certbot-renew.timer` runs it twice daily.
 
+**Editing the helper replaces the instance — including a comment-only edit.** Its SHA-256 is pinned
+into `user_data` by `filesha256`, and `user_data_replace_on_change = true`, so any byte that changes
+in `infra/dig-origin-cert.sh` changes `user_data` and recycles the node. That is correct — the host
+must run the version that was reviewed — but it means a typo fix in a comment costs a replacement.
+Batch helper edits rather than trickling them.
+
+**A publish failure is degraded, not down.** If `put-secret-value` fails, the host keeps serving and
+logs a `WARNING` naming the cost: the durable copy still holds the previous certificate, so the next
+replacement restores that, renews, and spends a rate-limited issuance — every time, until write
+access is fixed. `grep WARNING` in the cloud-init log or the certbot-renew journal is how you find
+it; there is no alarm yet.
+
 **Two things must not be "tidied up".**
 
 - The certificate carries a second name, `rpc-origin.dig.net`, with no DNS record. Let's Encrypt

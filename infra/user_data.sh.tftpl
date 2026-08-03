@@ -73,7 +73,9 @@ grep -q '^user_allow_other' /etc/fuse.conf || echo 'user_allow_other' >>/etc/fus
 install_verified() {
   local url="$1" sha="$2" dest="$3" tmp
   tmp="$(mktemp)"
-  curl -fsSL -o "$tmp" "$url"
+  # --retry because this now fetches the certificate helper as well as the two binaries, and a
+  # transient blip at boot would leave a replaced instance with no way to serve.
+  curl -fsSL --retry 3 --retry-connrefused --retry-delay 2 -o "$tmp" "$url"
   echo "$sha  $tmp" | sha256sum -c -
   install -m 0755 -o root -g root "$tmp" "$dest"
   rm -f "$tmp"

@@ -173,8 +173,10 @@ apply_gateway_access() {
   local dir
   for dir in "$STATE_DIR/live" "$STATE_DIR/archive"; do
     [ -d "$dir" ] && [ ! -L "$dir" ] || continue
-    chgrp -h -R "$CERT_GROUP" "$dir"
-    chmod -R g+rX "$dir"
+    if ! chgrp -h -R "$CERT_GROUP" "$dir" || ! chmod -R g+rX "$dir"; then
+      log "could not give $CERT_GROUP read access to $dir"
+      return 1
+    fi
   done
 }
 
@@ -315,17 +317,6 @@ import re
 import shutil
 import sys
 
-try:
-    from configobj import ConfigObj
-except ImportError:
-    # Exit 2: the HOST is broken, not the payload. See the comment above the function.
-    print("configobj is unavailable, so a renewal config cannot be examined", file=sys.stderr)
-    raise SystemExit(2)
-
-renewal_dir = sys.argv[1]
-if not os.path.isdir(renewal_dir):
-    raise SystemExit(0)
-
 # Everything certbot writes for this deployment. A key outside these sets is not something the
 # renewal needs, and dropping it is always safe.
 TOP_LEVEL = {"version", "archive_dir", "cert", "privkey", "chain", "fullchain"}
@@ -338,52 +329,85 @@ RENEWAL_PARAMS = {
 }
 CONFIG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.conf$")
 
-dropped = []
+# Exit codes are a CONTRACT with the shell, which routes on them:
+#   0 = examined, output lists what was dropped
+#   1 = the PAYLOAD is at fault (a config that will not parse) -> caller may fall back
+#   2 = this HOST is at fault -> caller must NOT treat it as "nothing is stored"
+PAYLOAD_FAULT = 1
+HOST_FAULT = 2
 
-for name in sorted(os.listdir(renewal_dir)):
-    path = os.path.join(renewal_dir, name)
 
-    # A name certbot would never read is a name that exists to hide something. Note certbot's own
-    # glob skips dot-files, so `.evil.conf` would sit on disk unexamined by any name-based filter.
-    if os.path.islink(path) or not os.path.isfile(path) or not CONFIG_NAME.match(name):
-        if os.path.isdir(path) and not os.path.islink(path):
-            shutil.rmtree(path)
-        else:
-            os.remove(path)
-        dropped.append("file %s" % name)
-        continue
+def sanitize(renewal_dir):
+    """Reduce every config in renewal_dir to recognised keys. Returns what was dropped."""
+    if not os.path.isdir(renewal_dir):
+        return []
 
-    try:
-        config = ConfigObj(path, file_error=True)
-    except Exception as exc:
-        print("renewal config %s does not parse: %s" % (name, exc), file=sys.stderr)
-        raise SystemExit(1)
+    dropped = []
+    for name in sorted(os.listdir(renewal_dir)):
+        path = os.path.join(renewal_dir, name)
 
-    for key in list(config.scalars):
-        if key not in TOP_LEVEL:
-            del config[key]
-            dropped.append("%s: %s" % (name, key))
-
-    for section in list(config.sections):
-        if section != "renewalparams":
-            del config[section]
-            dropped.append("%s: [%s]" % (name, section))
+        # A name certbot would never read is a name that exists to hide something. Note certbot's
+        # own glob skips dot-files, so `.evil.conf` would sit on disk unexamined by any name-based
+        # filter.
+        if os.path.islink(path) or not os.path.isfile(path) or not CONFIG_NAME.match(name):
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            dropped.append("file %s" % name)
             continue
-        params = config[section]
-        for key in list(params.scalars):
-            if key not in RENEWAL_PARAMS:
-                del params[key]
-                dropped.append("%s: [renewalparams] %s" % (name, key))
-        for nested in list(params.sections):
-            del params[nested]
-            dropped.append("%s: [renewalparams][%s]" % (name, nested))
 
-    config.write()
+        try:
+            config = ConfigObj(path, file_error=True)
+        except Exception as exc:
+            print("renewal config %s does not parse: %s" % (name, exc), file=sys.stderr)
+            raise SystemExit(PAYLOAD_FAULT)
+
+        for key in list(config.scalars):
+            if key not in TOP_LEVEL:
+                del config[key]
+                dropped.append("%s: %s" % (name, key))
+
+        for section in list(config.sections):
+            if section != "renewalparams":
+                del config[section]
+                dropped.append("%s: [%s]" % (name, section))
+                continue
+            params = config[section]
+            for key in list(params.scalars):
+                if key not in RENEWAL_PARAMS:
+                    del params[key]
+                    dropped.append("%s: [renewalparams] %s" % (name, key))
+            for nested in list(params.sections):
+                del params[nested]
+                dropped.append("%s: [renewalparams][%s]" % (name, nested))
+
+        config.write()
+
+    return dropped
+
+
+try:
+    from configobj import ConfigObj
+except ImportError:
+    print("configobj is unavailable, so a renewal config cannot be examined", file=sys.stderr)
+    raise SystemExit(HOST_FAULT)
+
+# Anything unforeseen — a full disk during write(), a permission error on remove(), an encoding
+# surprise — is a fact about this HOST, not evidence about the payload, so it must not fall out as
+# the payload code. Only the parse failure above is allowed to claim that.
+try:
+    entries = sanitize(sys.argv[1])
+except SystemExit:
+    raise
+except BaseException as exc:
+    print("unexpected failure examining renewal configs: %r" % (exc,), file=sys.stderr)
+    raise SystemExit(HOST_FAULT)
 
 # These names came out of an attacker-controllable file and are about to be logged. Strip anything
 # that is not printable ASCII so a crafted key cannot forge log lines with CR or terminal escapes.
-for item in dropped:
-    print(re.sub(r"[^ -~]", "?", item))
+for item in entries:
+    print(re.sub(r"[^\x20-\x7e]", "?", item))
 PYTHON
 }
 
@@ -467,22 +491,33 @@ restore() {
 
   local dropped sanitize_status
   dropped="$(sanitize_renewal_configs)" && sanitize_status=0 || sanitize_status=$?
-  if [ "$sanitize_status" -eq 2 ]; then
-    log "cannot examine a renewal config on this host; refusing to judge the stored payload"
-    return "$RESTORE_FAILED"
-  fi
-  if [ "$sanitize_status" -ne 0 ]; then
+  # Exit 1 is the ONLY code the helper deliberately returns for a fault in the PAYLOAD. Everything
+  # else — 2 for a missing configobj, 127 for a missing python3, 137 for an OOM kill, a signal — is
+  # a fact about this HOST, and must not reach the branch that spends an issuance. The first
+  # version of this had the default the other way round, which is the same guard-too-specific
+  # mistake twice: it named the failures it had thought of instead of the class.
+  case "$sanitize_status" in
+  0) : ;;
+  1)
     log "the stored archive holds a renewal config that cannot be parsed"
     return "$RESTORE_ABSENT"
-  fi
+    ;;
+  *)
+    log "cannot examine a renewal config on this host (status $sanitize_status);"       "refusing to judge the stored payload"
+    return "$RESTORE_FAILED"
+    ;;
+  esac
   if [ -n "$dropped" ]; then
     log "dropped unrecognised renewal-config entries: $(echo "$dropped" | tr '
 ' ';')"
   fi
 
-  chown -R "$STATE_OWNER" "$STAGING"
-  find "$STAGING" -type d -exec chmod 700 {} +
-  find "$STAGING" -type f -exec chmod 600 {} +
+  if ! chown -R "$STATE_OWNER" "$STAGING" ||
+    ! find "$STAGING" -type d -exec chmod 700 {} + ||
+    ! find "$STAGING" -type f -exec chmod 600 {} +; then
+    log "could not impose ownership and modes on the staged state"
+    return "$RESTORE_FAILED"
+  fi
 
   install_state || return "$RESTORE_FAILED"
   apply_gateway_access
@@ -498,29 +533,69 @@ restore() {
 #
 # The payload reaches the API as a file reference, never as an argument: anything on a command
 # line is readable by every process on the host through /proc, and this box is internet-facing.
+# EVERY step is checked, and the success line is reachable only from an API call that succeeded.
+#
+# This function is called from inside `renew`, which callers invoke from an `if` — and `set -e` is
+# suspended for the whole nested body of a function called in a condition. So an unchecked
+# `aws put-secret-value` would fail, fall through, and reach the "published" log anyway. The
+# consequence is not cosmetic: the durable copy would keep the OLD certificate while the log
+# asserted otherwise, and every later replacement would restore that stale copy, renew, and spend
+# an issuance — #2037 again, wearing a reassuring log line.
 save() {
-  certificate_is_present ||
-    die "refusing to publish: there is no usable certificate at $LIVE_DIR"
+  if ! certificate_is_present; then
+    log "refusing to publish: there is no usable certificate at $LIVE_DIR"
+    return 1
+  fi
 
   local members=() dir
   for dir in "${CERTBOT_STATE_DIRS[@]}"; do
     [ -e "$STATE_DIR/$dir" ] && members+=("./$dir")
   done
 
-  tar -czf "$WORK/state.tar.gz" -C "$STATE_DIR" "${members[@]}"
-  base64 -w0 <"$WORK/state.tar.gz" >"$WORK/payload.b64"
+  if ! tar -czf "$WORK/state.tar.gz" -C "$STATE_DIR" "${members[@]}"; then
+    log "could not pack the certbot state"
+    return 1
+  fi
+  if ! base64 -w0 <"$WORK/state.tar.gz" >"$WORK/payload.b64"; then
+    log "could not encode the certbot state"
+    return 1
+  fi
   chmod 600 "$WORK/payload.b64"
 
   local encoded_bytes
   encoded_bytes="$(wc -c <"$WORK/payload.b64")"
-  [ "$encoded_bytes" -le "$MAX_ENCODED_BYTES" ] ||
-    die "the certbot state encodes to $encoded_bytes bytes, over the $MAX_ENCODED_BYTES ceiling"
+  if [ "$encoded_bytes" -gt "$MAX_ENCODED_BYTES" ]; then
+    log "the certbot state encodes to $encoded_bytes bytes, over the $MAX_ENCODED_BYTES ceiling"
+    return 1
+  fi
 
-  aws secretsmanager put-secret-value \
-    --region "$REGION" --secret-id "$SECRET_ID" \
-    --secret-string "file://$WORK/payload.b64" >/dev/null
+  local attempt
+  for attempt in 1 2 3; do
+    if aws secretsmanager put-secret-value \
+      --region "$REGION" --secret-id "$SECRET_ID" \
+      --secret-string "file://$WORK/payload.b64" >/dev/null 2>"$WORK/put.err"; then
+      log "published the origin certificate to $SECRET_ID ($encoded_bytes bytes encoded)"
+      return 0
+    fi
+    log "could not publish to $SECRET_ID (attempt $attempt of 3): $(tail -1 "$WORK/put.err")"
+    if [ "$attempt" -lt 3 ]; then
+      sleep "$((attempt * RETRY_DELAY_SECONDS))"
+    fi
+  done
+  return 1
+}
 
-  log "published the origin certificate to $SECRET_ID ($encoded_bytes bytes encoded)"
+# What a failed publish actually costs, said once, because all three callers must say the same
+# thing and it is the sentence an operator has to act on.
+#
+# Deliberately NOT fatal. The certificate works and the origin should come up; refusing to serve
+# would turn a degraded durable copy into an outage. The cost is deferred, not absent, so it is
+# spelled out rather than summarised.
+warn_not_published() {
+  log "WARNING: this host is SERVING a certificate that is NOT stored in $SECRET_ID." \
+    "The durable copy still holds the previous one, so the next instance replacement will" \
+    "restore that, renew, and spend a rate-limited issuance — every time, until write access" \
+    "to the secret is fixed."
 }
 
 # --- issue ---------------------------------------------------------------------------------------
@@ -548,8 +623,8 @@ issue() {
     die "certbot could not obtain a certificate for $PEER_HOST"
   fi
 
-  apply_gateway_access
-  save
+  apply_gateway_access || die "could not grant the gateway access to the new certificate"
+  save || warn_not_published
 }
 
 # --- renew ---------------------------------------------------------------------------------------
@@ -577,8 +652,8 @@ renew() {
     return 0
   fi
 
-  apply_gateway_access
-  save
+  apply_gateway_access || die "could not grant the gateway access to the renewed certificate"
+  save || warn_not_published
   # certbot rewriting the file does nothing on its own — the gateway holds the certificate it
   # read at startup until it restarts. `try-restart` is a no-op when the gateway is not running,
   # which is the case during first boot.
@@ -616,8 +691,8 @@ serve_restored() {
 adopt_or_issue() {
   if certificate_is_present && certificate_is_valid_now; then
     log "nothing is stored, but this host already holds a usable certificate; publishing it"
-    apply_gateway_access
-    save
+    apply_gateway_access || die "could not grant the gateway access to the certificate"
+    save || warn_not_published
     return 0
   fi
   issue
@@ -642,7 +717,7 @@ ensure() {
     # move that caused #2037. Serve what is on disk if it can serve, and otherwise stop.
     if certificate_is_present && certificate_is_valid_now; then
       log "could not read $SECRET_ID; serving the certificate already on this host"
-      apply_gateway_access
+      apply_gateway_access || die "could not grant the gateway access to the certificate"
       return 0
     fi
     die "could not read $SECRET_ID and no usable certificate is on disk;" \
