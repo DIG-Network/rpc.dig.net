@@ -28,6 +28,7 @@
 
 pub mod gate;
 pub mod jsonrpc;
+pub mod release;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod tier;
