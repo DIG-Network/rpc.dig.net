@@ -1,0 +1,248 @@
+# Keep the dig-node behind rpc.dig.net on the newest stable release, without a human.
+#
+# WHY THIS EXISTS
+#
+# The node sat on v0.84.0 while dig-node's main was at 0.93.9 — nine minor versions of merged work,
+# including the fix for a live *.on.dig.net outage. Nothing was broken: `modules/apps` cuts stable
+# tags by manual dispatch only, so the version moved only when someone hand-cut a release and
+# hand-edited three repository variables. This removes the human from that loop
+# (dig_ecosystem#2073).
+#
+# WHY IT INSTALLS IN PLACE INSTEAD OF RE-APPLYING TERRAFORM
+#
+# The node version is baked into user_data and `user_data_replace_on_change = true`, so an apply
+# REPLACES the instance. A replacement re-runs `dnf -y update` (an unpinned input) and re-restores
+# the origin certificate — and if that restore ever fails, it falls through to ordering a new one.
+# Let's Encrypt allows five per week for that identifier set, and exhausting them took the read
+# tier down for ~21 hours (dig_ecosystem#2037). A scheduled, unattended replacement would put that
+# failure mode on a timer. Swapping one checksum-verified binary does not.
+#
+# ONE WRITER, STILL. This workflow never runs `terraform apply` and never touches an AWS resource;
+# deploy.yml remains the only thing that does. What it does do is change what is installed on the
+# host that an apply also installs to, so the two must never overlap — hence the SHARED concurrency
+# group below (dig_ecosystem#1938, where two pipelines deploying one service silently undid each
+# other for twelve minor versions).
+#
+# WHY IT BUMPS THE REPOSITORY VARIABLES TOO. DIG_NODE_VERSION is the bootstrap floor: what a fresh
+# instance installs. Updating the host without updating it would mean the next deploy silently
+# REVERTED the node (dig_ecosystem#2034). Both move in the same run, only after the host is
+# verified healthy, so the pin and reality cannot disagree.
+#
+# Third-party actions are pinned to a full commit SHA (a mutable tag could be re-pointed).
+
+name: auto-update-node
+
+on:
+  schedule:
+    # 07:17 UTC. Deliberately clear of the certbot renewal timer (03:00/15:00 UTC with up to an
+    # hour of jitter) and of dig-node's midnight-UTC nightly build, and deliberately not on the
+    # hour — GitHub's scheduler is heavily contended at :00 and delays runs.
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Install this exact tag (e.g. v0.84.0) instead of the newest stable. This is the rollback path, and it is the only way to install an older release."
+        required: false
+        type: string
+      dry_run:
+        description: "Resolve the release and compute its checksum, then stop without touching the host."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read # checkout
+  id-token: write # OIDC into the deploy role
+
+concurrency:
+  group: deploy-rpc-dig-net
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: update the node in place
+    runs-on: ubuntu-latest
+    environment: production
+    # The kill switch: `gh variable set DIG_NODE_AUTOUPDATE --body off` stops the schedule at the
+    # next tick. It deliberately does NOT stop a manual dispatch — the fastest way out of a bad
+    # release is a deliberate rollback, and disabling updates must not disable that too.
+    if: vars.DIG_NODE_AUTOUPDATE != 'off' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
+      # Which release, decided by src/release.rs rather than by shell. Every rule it applies —
+      # prereleases are ineligible, tags order numerically, the asset name is constructed and not
+      # searched for, the URL must be canonical — is unit-tested there.
+      - name: choose the release
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT: ${{ vars.DIG_NODE_VERSION }}
+          REQUIRE: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          gh api "repos/DIG-Network/dig-node/releases?per_page=100" >releases.json
+
+          ARGS=(--current "$CURRENT")
+          if [ -n "$REQUIRE" ]; then
+            ARGS+=(--require "$REQUIRE")
+            echo "an exact tag was requested: $REQUIRE"
+          fi
+
+          cargo run --quiet --locked --bin pick-node-release -- "${ARGS[@]}" \
+            <releases.json | tee -a "$GITHUB_OUTPUT"
+
+      - name: nothing to do
+        if: steps.pick.outputs.update != 'true'
+        run: echo "the host is already on ${{ steps.pick.outputs.tag }}"
+
+      # Download the artifact and take the checksum FROM THE BYTES. Never from a checksum file and
+      # never from the API: the digest must describe the bytes that actually get installed.
+      - name: fetch the artifact and checksum it
+        id: artifact
+        if: steps.pick.outputs.update == 'true'
+        env:
+          URL: ${{ steps.pick.outputs.url }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 2 -o dig-node "$URL"
+
+          SHA="$(sha256sum dig-node | cut -d' ' -f1)"
+          echo "sha=$SHA" >>"$GITHUB_OUTPUT"
+          echo "sha256=$SHA  size=$(stat -c%s dig-node)"
+
+          # The host is Graviton. A correctly named asset built for the wrong architecture, or a
+          # package that slipped into the raw asset slot, has a perfectly valid checksum and fails
+          # only once systemd tries to run it. Catch it here, on a runner, where failing is free.
+          KIND="$(file -b dig-node)"
+          echo "kind: $KIND"
+          case "$KIND" in
+            *"ELF 64-bit LSB"*"ARM aarch64"*) ;;
+            *) echo "REFUSING: $URL is not an aarch64 ELF executable" >&2; exit 1 ;;
+          esac
+
+      - name: dry run — stopping before the host is touched
+        if: steps.pick.outputs.update == 'true' && inputs.dry_run
+        run: |
+          echo "would install ${{ steps.pick.outputs.tag }}"
+          echo "  url: ${{ steps.pick.outputs.url }}"
+          echo "  sha: ${{ steps.artifact.outputs.sha }}"
+
+      - uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        if: steps.pick.outputs.update == 'true' && !inputs.dry_run
+        with:
+          role-to-assume: ${{ vars.CI_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # By tag, not by `terraform output` — this workflow stays entirely out of terraform's way,
+      # taking neither its state lock nor a dependency on its backend.
+      - name: find the node host
+        id: host
+        if: steps.pick.outputs.update == 'true' && !inputs.dry_run
+        run: |
+          set -euo pipefail
+          IIDS="$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=rpc-dig-net-node" \
+                      "Name=tag:role,Values=public-gateway-node" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)"
+
+          # Exactly one, or stop. Two matches means a replacement is in flight, or something else
+          # is running under this name; guessing which box to modify is not an option. `--output
+          # text` separates ids with whitespace, so counting words is the whole check.
+          COUNT="$(wc -w <<<"$IIDS")"
+          [ "$COUNT" = "1" ] || { echo "expected exactly one running node, found $COUNT: $IIDS" >&2; exit 1; }
+
+          echo "id=$IIDS" >>"$GITHUB_OUTPUT"
+          echo "since=$(date -u '+%Y-%m-%d %H:%M:%S')" >>"$GITHUB_OUTPUT"
+          echo "node host: $IIDS"
+
+      - name: install it on the host
+        if: steps.pick.outputs.update == 'true' && !inputs.dry_run
+        env:
+          IID: ${{ steps.host.outputs.id }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          URL: ${{ steps.pick.outputs.url }}
+          SHA: ${{ steps.artifact.outputs.sha }}
+          # A named tag is a deliberate rollback and may go backwards; the schedule never may.
+          ALLOW_DOWNGRADE: ${{ inputs.version != '' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+
+          # Re-assert the shape at the boundary. src/release.rs already guarantees all three, but
+          # this is the last thing between a value and root execution on a public-facing host, and
+          # the check costs nothing.
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad tag: $TAG" >&2; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "bad sha: $SHA" >&2; exit 1; }
+          [[ "$URL" =~ ^https://github\.com/DIG-Network/dig-node/releases/download/v[0-9.]+/dig-node-[0-9.]+-linux-arm64$ ]] \
+            || { echo "bad url: $URL" >&2; exit 1; }
+
+          # `printf %q` quotes each value for the shell that will receive it. AWS-RunShellScript
+          # concatenates its commands into one script, so the prelude's exports are in scope for
+          # the script that follows, and update-node.sh stays a normal reviewable file rather than
+          # an escaped one-liner.
+          PRELUDE="$(printf 'export NEW_URL=%q NEW_SHA=%q NEW_VERSION=%q ALLOW_DOWNGRADE=%q' \
+            "$URL" "$SHA" "$TAG" "$ALLOW_DOWNGRADE")"
+          PARAMS="$(jq -Rs --arg prelude "$PRELUDE" '{commands: [$prelude, .]}' .github/update-node.sh)"
+
+          .github/run-on-host.sh "$IID" "$PARAMS" 900
+
+      # The acceptance bar every deploy passes, re-run against the updated node — the mount, the
+      # allowlist boundary, the loopback-only control surface, the peer ports, the listener set.
+      # VERIFY_SINCE bounds the peer-connection count to this run, so it proves the NEW binary
+      # peered rather than counting the old one's journal entries.
+      - name: verify the node is actually serving
+        if: steps.pick.outputs.update == 'true' && !inputs.dry_run
+        env:
+          IID: ${{ steps.host.outputs.id }}
+          SINCE: ${{ steps.host.outputs.since }}
+        run: |
+          set -euo pipefail
+          PRELUDE="$(printf 'export VERIFY_SINCE=%q' "$SINCE")"
+          PARAMS="$(jq -Rs --arg prelude "$PRELUDE" '{commands: [$prelude, .]}' .github/verify-node.sh)"
+          .github/run-on-host.sh "$IID" "$PARAMS" 900
+
+      # Only now, with the host proven healthy on the new release. Doing this earlier would record
+      # a version the host might have rolled back from; not doing it at all would let the next
+      # `terraform apply` reinstall the old pin over a working node (dig_ecosystem#2034).
+      #
+      # RELEASE_TOKEN rather than GITHUB_TOKEN: GITHUB_TOKEN cannot write repository variables.
+      - name: move the bootstrap pin to what is now running
+        if: steps.pick.outputs.update == 'true' && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          URL: ${{ steps.pick.outputs.url }}
+          SHA: ${{ steps.artifact.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh variable set DIG_NODE_VERSION      --repo "$REPO" --body "$TAG"
+          gh variable set DIG_NODE_ARTIFACT_URL --repo "$REPO" --body "$URL"
+          gh variable set DIG_NODE_SHA256       --repo "$REPO" --body "$SHA"
+          echo "bootstrap pin now $TAG; a fresh instance installs the same release the host runs"
+
+      # Judge the live endpoint, not the workflow. Everything above ran on the host or against the
+      # host; this is the only check that exercises what a reader actually reaches.
+      - name: the public read tier serves the new version
+        if: steps.pick.outputs.update == 'true' && !inputs.dry_run
+        env:
+          WANT: ${{ steps.pick.outputs.version }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 20); do
+            SAW="$(curl -fsS --max-time 15 https://rpc.dig.net/ \
+                     -H 'content-type: application/json' \
+                     -d '{"jsonrpc":"2.0","id":1,"method":"dig.health"}' 2>/dev/null \
+                   | jq -r '.result.version // empty')"
+            [ "$SAW" = "$WANT" ] && { echo "rpc.dig.net reports $SAW"; exit 0; }
+            sleep 15
+          done
+          echo "rpc.dig.net reports '${SAW:-<no answer>}', wanted '$WANT'" >&2
+          exit 1

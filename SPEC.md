@@ -249,7 +249,7 @@ s3://<capsule bucket>/{store_hex}/{root_hex}.dig
 | `9444` | TCP, mTLS | internet, dual-stack | dig-node — peer-RPC + DHT |
 | `9445` | TCP | internet, dual-stack | dig-node — gossip |
 | `3478` | UDP | **off by default** | STUN, only if the node serves it |
-| gateway (`8080`) | TCP | **CloudFront origin ranges only** | the gateway |
+| gateway (`443`) | TCP | **CloudFront origin ranges only** | the gateway |
 | `9778` | TCP | **loopback only — never exposed** | dig-node local surface |
 
 `9778` MUST NOT appear in any security group. STUN defaults off: an open UDP reflector is a
@@ -289,6 +289,47 @@ one. Certificate authorities rate-limit issuance, so a deployment that re-issues
 makes routine redeployment consume a scarce external resource and can lock itself out of its own
 origin.
 
+### 7.2 The node version, and what pins it
+
+The wrapped `dig-node` MUST track the newest **stable** `dig-node` release without human action.
+A deployment where advancing the node requires someone to remember MUST be treated as defective:
+this one sat nine minor versions behind for want of a manual step, including past the fix for a
+live outage.
+
+**`DIG_NODE_VERSION` is the bootstrap floor and the record of what is installed — not a manual
+pin.** It states which release a *fresh* instance installs at boot, and it is maintained
+automatically: whatever moves the running node MUST move it in the same operation. Two rules
+follow, and both are load-bearing:
+
+- The recorded version and the running version MUST NOT be allowed to diverge. If they may
+  diverge, the node's version becomes a function of whether an update or a deploy happened most
+  recently — a redeploy silently reverts the node, which is the same "nobody chose this version"
+  outcome a manual pin exists to prevent, reached from the other side.
+- A pinned version MUST remain expressible for a deliberate rollback, and choosing one MUST also
+  stop automatic selection from immediately undoing it.
+
+An update MUST:
+
+1. Install only a **published stable release** — never a prerelease, a draft, or a nightly — and
+   only its raw executable for the host's architecture. A packaged artifact (`.deb`, `.pkg`,
+   `.msi`) MUST NOT be installed as the node binary.
+2. Verify the artifact's SHA-256 **before** installing it, against a digest computed from the
+   bytes that will be installed. A digest read from a checksum file or an API response does not
+   satisfy this: the host is internet-facing on two peer ports, and an unverified download is not
+   an acceptable install path.
+3. Confirm the artifact **executes on the host** before it replaces the running binary. A checksum
+   establishes provenance, not that the file can be loaded on this architecture.
+4. Leave the node **running** on any failure. A failed update MUST NOT leave a half-installed
+   binary or a stopped service, and MUST restore the previous binary if the new one does not
+   serve.
+5. Judge success on **what is served**, not on what was installed: the node answering as the
+   installed version, through the gateway. An update that leaves the read tier down MUST fail.
+6. Move the node forward only. A downgrade MUST require an explicit request naming the version.
+
+Nothing about this may introduce a second writer of the deployment (§7.1's certificate reasoning
+applies to the whole stack): exactly one mechanism applies infrastructure, and an update path that
+changes what runs on the host MUST be mutually exclusive with it.
+
 ---
 
 ## 8. Observability
@@ -311,3 +352,8 @@ An implementation conforms when:
 5. No route other than those in §3 exists, and none of them but `POST /` contacts the node.
 6. `9778` is not reachable from any address other than loopback.
 7. A capsule published to the bucket is served without the file existing on the instance's disk.
+8. A new stable `dig-node` release reaches the running node with no human action (§7.2).
+9. An update offered a mismatched checksum, a packaged artifact, or a build that cannot execute on
+   the host installs nothing and leaves the node serving.
+10. A release that installs but does not serve is rolled back, and the deployment's recorded
+    version still names the release that is actually running.

@@ -21,10 +21,11 @@ merge to main -> release.yml cuts vX.Y.Z -> deploy.yml:
 | variable | `CI_DEPLOY_ROLE_ARN` | OIDC deploy role for this repo |
 | variable | `TF_STATE_BUCKET` | shared terraform state bucket |
 | variable | `TF_LOCK_TABLE` | shared terraform lock table |
-| variable | `DIG_NODE_VERSION` | pinned dig-node tag, e.g. `v0.65.0` |
-| variable | `DIG_NODE_ARTIFACT_URL` | linux-aarch64 dig-node binary URL for that tag |
-| variable | `DIG_NODE_SHA256` | its SHA-256 |
-| secret | `RELEASE_TOKEN` | PAT that pushes the changelog commit + tag |
+| variable | `DIG_NODE_VERSION` | dig-node tag a fresh instance boots on — **maintained automatically**, see "Node auto-update" |
+| variable | `DIG_NODE_ARTIFACT_URL` | linux-arm64 dig-node binary URL for that tag (maintained automatically) |
+| variable | `DIG_NODE_SHA256` | its SHA-256 (maintained automatically) |
+| variable | `DIG_NODE_AUTOUPDATE` | unset or anything but `off` = nightly updates on; `off` = schedule disabled |
+| secret | `RELEASE_TOKEN` | PAT that pushes the changelog commit + tag, **and writes the three `DIG_NODE_*` variables** (`GITHUB_TOKEN` cannot) |
 | environment | `production` | gates the apply |
 
 ### Required AWS pre-requisite: the origin-certificate secret
@@ -173,6 +174,136 @@ the set is the escape hatch, not the first move.
 Edit the `.tf` file, open a PR, let CI run `terraform validate`, merge. Never `aws ... modify` a
 live resource — a change made outside terraform is invisible in review and will be silently
 reverted or silently preserved forever depending on which resource it is.
+
+## Node auto-update
+
+`.github/workflows/auto-update-node.yml` keeps the dig-node on the newest **stable** dig-node
+release. It exists because the node sat on `v0.84.0` while dig-node's main was at `0.93.9` — nine
+minor versions, including the fix for a live `*.on.dig.net` outage. Nothing was broken:
+`modules/apps` cuts stable tags by manual dispatch only, and nothing drove the manual step
+(dig_ecosystem#2073).
+
+### How it triggers
+
+- **Nightly at 07:17 UTC.** Clear of the certbot renewal timer (03:00/15:00 ±1h) and of dig-node's
+  midnight-UTC nightly build. Not on the hour, because GitHub's scheduler is contended there.
+- **Manually**, any time: `gh workflow run auto-update-node.yml --repo DIG-Network/rpc.dig.net`.
+
+```
+newest stable dig-node release  (src/release.rs: no prereleases, numeric ordering,
+                                 the raw linux-arm64 asset by exact name, canonical URL)
+  -> download it on the runner, sha256 THE BYTES, reject anything that is not an aarch64 ELF
+  -> over SSM: verify the checksum on the host, prove the binary runs, keep the old one,
+     swap, restart dig-node + rpc-gateway, prove it serves, ROLL BACK if it does not
+  -> re-run .github/verify-node.sh (mount, allowlist boundary, peer ports, listener set)
+  -> move DIG_NODE_VERSION / _ARTIFACT_URL / _SHA256 to what is now running
+  -> confirm https://rpc.dig.net/ reports the new version
+```
+
+**It never runs `terraform apply`.** deploy.yml is still the one writer of AWS resources; this
+workflow changes one binary and two systemd units. The two share the `deploy-rpc-dig-net`
+concurrency group so they can never overlap.
+
+**Why not a full redeploy.** An apply replaces the instance (the version is inside user_data), and
+a replacement re-runs `dnf -y update` and re-restores the origin certificate. A restore failure
+falls through to ordering a certificate, and there are five per week — exhausting them is
+dig_ecosystem#2037, ~21 hours down. Nightly replacement puts that on a timer.
+
+**Why the variables move too.** `DIG_NODE_VERSION` is the bootstrap floor: what a *fresh* instance
+installs. If the host advanced and the variable did not, the next deploy would silently revert the
+node (dig_ecosystem#2034). They move together, only after the host is verified healthy.
+
+### Turn it off in a hurry
+
+```bash
+gh variable set DIG_NODE_AUTOUPDATE --repo DIG-Network/rpc.dig.net --body off
+```
+
+Effective at the next scheduled tick; nothing else changes and the node keeps running. This stops
+the **schedule only** — a manual dispatch still works, deliberately, because the fastest way out of
+a bad release is a rollback and disabling updates must not disable that too.
+
+Belt and braces, if the schedule must not fire at all:
+`gh workflow disable auto-update-node.yml --repo DIG-Network/rpc.dig.net`.
+
+Re-enable with `gh variable set DIG_NODE_AUTOUPDATE --body on` (any value but `off` works;
+deleting the variable also works).
+
+### Roll back to a specific version
+
+Two ways, fastest first.
+
+**1. On the host, seconds, no network.** The binary that was replaced is still there:
+
+```bash
+aws ssm start-session --target <instance-id>
+sudo mv /usr/local/bin/dig-node.rollback /usr/local/bin/dig-node
+sudo systemctl restart dig-node && sudo systemctl start rpc-gateway
+curl -s localhost:9778 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"dig.health"}'
+```
+
+This does NOT update `DIG_NODE_VERSION`, so turn the schedule off first or the next run puts the
+newer release straight back. Follow it with option 2 to make the rollback durable.
+
+**2. Through the workflow — durable, and the one to use.** Naming a version is the only way to
+install an older release; automatic selection is newest-wins and cannot go backwards.
+
+```bash
+gh variable set DIG_NODE_AUTOUPDATE --repo DIG-Network/rpc.dig.net --body off
+gh workflow run auto-update-node.yml --repo DIG-Network/rpc.dig.net -f version=v0.84.0
+gh run watch "$(gh run list --workflow auto-update-node.yml --limit 1 --json databaseId -q '.[0].databaseId')"
+```
+
+It runs the same gates — checksum from the bytes, aarch64 check, on-host verification, rollback if
+it does not serve — and leaves the three variables naming `v0.84.0`, so a later instance
+replacement boots on it too. Leave `DIG_NODE_AUTOUPDATE=off` until the bad release is superseded,
+otherwise the next nightly moves forward again.
+
+Rehearse without touching anything:
+`gh workflow run auto-update-node.yml -f dry_run=true` resolves the release and computes the
+checksum, then stops before the host is contacted.
+
+### When it fails
+
+A failed update leaves the node **running** — that is the design, and the workflow going red is
+the only symptom you should see. Read the run's on-host output; it names which gate stopped it.
+
+| the log says | what happened | what to do |
+|---|---|---|
+| `sha256sum: WARNING` | the download did not match the digest taken from the bytes the runner fetched | nothing was installed; re-run. Twice in a row means the release assets changed under the tag — do not bypass it |
+| `REFUSING: … is not an aarch64 ELF` | the release published something other than a raw arm64 executable in that slot | nothing was contacted; fix it upstream in dig-node |
+| `REFUSING: … is older than` | someone asked for a downgrade without naming it as one | use `-f version=…`, which permits it deliberately |
+| `ROLLED BACK` | the release installed but never served; the previous binary is back | the node is fine. Set `DIG_NODE_AUTOUPDATE=off` so the nightly stops retrying, and report the release |
+| `CRITICAL: rollback … did not restore service` | **the tier is down** | this is the one that needs a human — go to the host over SSM, check `journalctl -u dig-node -u rpc-gateway`, and use rollback option 1 |
+| `expected exactly one running node` | a deploy is mid-flight, or something else carries the node's tags | wait for the deploy, then re-run |
+
+Do not judge this by the workflow badge alone — judge the endpoint:
+
+```bash
+curl -s https://rpc.dig.net/ -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"dig.health"}' | jq -r .result.version
+```
+
+### The beacon is the eventual home for this
+
+Every other DIG host updates through **dig-updater** — the beacon, a scheduled run of dig-updater
+itself, trust-rooted on the pinned `BEACON_ROOT_PUBKEY_B64` and reading the signed manifest at
+`https://updates.dig.net/v1/stable/manifest.json`. This host does not, for one reason: **there is
+no linux-arm64 build of anything involved.** dig-updater's release matrix is
+`x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`
+— no aarch64 Linux — and the live manifest's only Linux dig-node artifact is
+`dig-node_<v>_amd64.deb`. This host is Graviton. There is no beacon binary it can run and no
+artifact the beacon could install on it.
+
+When dig-updater ships linux-arm64 and the manifest carries a linux-arm64 dig-node artifact, this
+workflow should be replaced by installing the beacon — with one thing kept: whatever updates the
+node must still move `DIG_NODE_VERSION`, or an instance replacement reverts it (dig_ecosystem#2034).
+
+Probing note: `updates.dig.net` is CloudFront over S3 with ListBucket denied, so it answers **403
+for anything missing, including a path that never existed**. `/v1/stable` 403s while
+`/v1/stable/manifest.json` returns 200. Never read a 403 there as "the feed is broken" — control
+against a deliberately bogus path first.
 
 ## Run locally
 

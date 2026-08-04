@@ -113,3 +113,55 @@ bytes and decompresses before running — which took ~24 KiB to ~8.9 KiB.
 The limit therefore applies to the *compressed* bytes, which is a lot of headroom, but it is
 invisible until an apply. The guard belongs at PR time, not deploy time: a test gzips the rendered
 template and asserts the size, so the failure is a review comment instead of a red deploy.
+
+## `set -e` kills a script at an assignment whose command substitution fails
+
+`.github/update-node.sh` read the origin hostname out of `/etc/dig-origin-cert.env`:
+
+```bash
+ORIGIN_HOST="$(sed -n 's/^DIG_ORIGIN_CERT_HOST=//p' "$CERT_ENV" 2>/dev/null | head -1)"
+ORIGIN_HOST="${ORIGIN_HOST:-node-rpc.dig.net}"     # the "fallback"
+```
+
+On a host without that file it exited **2, before printing anything at all** — looking exactly like
+a bash syntax error, with the fallback never reached. Under `set -e` the exit status of a simple
+assignment IS the status of its command substitution, so the shell exits there. The fallback only
+gets to be a fallback if reading is allowed to fail: `… | head -1 || true`.
+
+The neighbouring `A && B` idiom is NOT affected and does not need guarding — bash exempts a command
+that fails as the non-final member of an `&&`/`||` list, which is why
+`[ "$PING" = Online ] && break` has always been safe here. The two look alike and behave oppositely.
+
+Worth keeping because of how it was found: the behavioural harness caught it on its first run. A
+`bash -n` syntax check passes, `shellcheck` says nothing, and on the real host the file exists so
+the bug is invisible — it would have surfaced only on a host where something else was already wrong.
+
+## rpc.dig.net cannot use the beacon: nothing in the update path is built for linux-arm64
+
+The obvious way to auto-update this node is to install `dig-updater` and let the signed manifest
+drive it, like every other DIG host. It is not available here, and the reason is worth recording
+because the design keeps looking correct until someone checks the artifact lists:
+
+- dig-updater's build matrix is `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`,
+  `aarch64-apple-darwin`, `x86_64-apple-darwin`. **No aarch64 Linux.** There is no beacon binary
+  this host can execute.
+- The live manifest's only Linux `dig-node` artifact is `dig-node_<v>_amd64.deb` — wrong
+  architecture, and a `.deb` installed as the node binary bricks the host anyway.
+
+This box is `t4g.small`, Graviton. Both gaps have to close upstream before the beacon is an option.
+
+**Probing `updates.dig.net` will mislead you.** It is CloudFront over S3 with ListBucket denied, so
+it answers **403 for anything missing, including a path that never existed** — `/v1/stable` 403s
+while `/v1/stable/manifest.json` returns 200. A 403 there is not evidence of anything until you
+control against a deliberately bogus path.
+
+## An artifact's checksum says nothing about whether it runs here
+
+The install path verifies SHA-256 before installing, which is the right gate and an incomplete one:
+a correctly-named asset built for amd64 has a perfectly valid digest. Provenance and executability
+are different claims. The update path now proves both — `file` must report an aarch64 ELF on the
+runner, and the staged binary must answer `--version` on the host — before anything is swapped.
+
+The same distinction explains why the asset name is **constructed** (`dig-node-<v>-linux-arm64`)
+rather than searched for. A substring match on "arm64" also finds `dig-node_<v>_arm64.deb`, which
+is the right architecture, the right project, the right version — and unbootable as `/usr/local/bin/dig-node`.

@@ -90,8 +90,18 @@ echo "9444 + 9445 listening"
 echo "--- this node is actually peered, not just listening ---"
 # A bound socket proves nothing about reachability. Require at least one established peer
 # connection, which is the difference between "a node" and "a node on the network".
+#
+# VERIFY_SINCE bounds the window. On a fresh instance the journal starts at boot, so reading all
+# of it is exactly right and the variable stays unset. After an IN-PLACE update
+# (.github/update-node.sh) the journal still holds the previous binary's lines, so an unbounded
+# grep counts peers the OLD node made and passes without proving anything about the new one.
+JOURNAL=(-u dig-node --no-pager)
+if [ -n "${VERIFY_SINCE:-}" ]; then
+  JOURNAL+=(--since "$VERIFY_SINCE")
+  echo "counting peer connections established since $VERIFY_SINCE"
+fi
 for _ in $(seq 1 24); do
-  PEERED="$(journalctl -u dig-node --no-pager 2>/dev/null | grep -c 'peer connection established' || true)"
+  PEERED="$(journalctl "${JOURNAL[@]}" 2>/dev/null | grep -c 'peer connection established' || true)"
   [ "${PEERED:-0}" -gt 0 ] && break
   sleep 5
 done
