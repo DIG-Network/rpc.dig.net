@@ -4,7 +4,12 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.2.6] - 2026-08-04
+## [0.3.0] - 2026-08-04
+
+### Features
+- **update:** Auto-update the node nightly, in place over SSM (#14)
+
+## [0.94.0] - 2026-08-04
 
 ### Bug Fixes
 - **deploy:** Verify the gateway on 443 and count .dig capsules (#13)
