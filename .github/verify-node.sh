@@ -20,16 +20,34 @@ echo "--- capsules come from S3, not from this disk ---"
 # EXISTS and is simply empty, so a listing alone would look like "no capsules yet" rather than a
 # broken storage tier.
 mountpoint /var/lib/dig-node/cache/modules
-echo "capsules visible: $(find /var/lib/dig-node/cache/modules -name '*.module' 2>/dev/null | wc -l)"
+# `.dig` is the canonical capsule suffix. This counted `*.module` — the retired spelling — and so
+# reported "capsules visible: 0" against a fully-populated mount, which reads as a broken storage
+# tier on every deploy. `.module` stays in the glob only so a node mid-migration is not undercounted
+# (dig-node's `migrate_legacy_module_extensions` renames them at bring-up).
+CAPSULES="$(find /var/lib/dig-node/cache/modules \( -name '*.dig' -o -name '*.module' \) 2>/dev/null | wc -l)"
+echo "capsules visible: $CAPSULES"
+# Zero capsules behind a healthy mountpoint means the bucket is unreadable or empty — the node will
+# answer /health and then miss every read. That must fail the deploy, not print a zero and pass.
+[ "$CAPSULES" -gt 0 ] || { echo "FAIL: the capsule mount is a mountpoint but exposes no capsules" >&2; exit 1; }
 
 echo "--- the gateway answers ---"
-curl -fsS --max-time 5 localhost:8080/health
+# The gateway terminates TLS on 443 (GATEWAY_LISTEN=0.0.0.0:443); it has not served plaintext 8080
+# since that cutover, so probing 8080 failed on every healthy deploy and reported the whole run RED
+# (dig_ecosystem#2034). A verification step that is always red is worse than none — it trains the
+# operator to ignore a genuine failure, and this repo has had one.
+#
+# `--resolve` pins the real certificate name to the loopback address, so this still validates the
+# cert chain the public depends on rather than skipping verification with `-k`. A verify step is
+# the right place to catch an expired or misissued cert (see #2037, which took the tier down ~21h).
+GATEWAY="https://node-rpc.dig.net"
+RESOLVE=(--resolve "node-rpc.dig.net:443:127.0.0.1")
+curl -fsS --max-time 5 "${RESOLVE[@]}" "$GATEWAY/health"
 echo
 
 echo "--- an allowlisted method reaches the node ---"
 # Must NOT come back -32601: that would mean the gateway is refusing everything, which would make
 # the boundary check below pass for the wrong reason.
-ALLOWED="$(curl -fsS --max-time 20 localhost:8080 \
+ALLOWED="$(curl -fsS --max-time 20 "${RESOLVE[@]}" "$GATEWAY" \
   -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"dig.health"}')"
 echo "$ALLOWED"
@@ -37,7 +55,7 @@ echo "$ALLOWED" | grep -q -- '-32601' && { echo "FAIL: the gateway refused an al
 
 echo "--- a restricted method does not ---"
 for method in control.status cache.clear dig.listInventory sign; do
-  OUT="$(curl -fsS --max-time 10 localhost:8080 \
+  OUT="$(curl -fsS --max-time 10 "${RESOLVE[@]}" "$GATEWAY" \
     -H 'content-type: application/json' \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\"}")"
   echo "$OUT" | grep -q -- '-32601' || { echo "FAIL: $method was not refused: $OUT" >&2; exit 1; }
@@ -85,12 +103,15 @@ echo "--- nothing else is listening on a routable address ---"
 # every non-loopback listener and assert the set is exactly what this service intends.
 UNEXPECTED="$(ss -tlnH 2>/dev/null | awk '{print $4}' \
   | grep -vE '^(127\.0\.0\.1|\[::1\]):' \
-  | grep -vE ':(9444|9445|8080)$' || true)"
+  | grep -vE ':(9444|9445|443)$' || true)"
 if [ -n "$UNEXPECTED" ]; then
   echo "FAIL: unexpected listener(s) on a routable address:" >&2
   echo "$UNEXPECTED" >&2
   exit 1
 fi
-echo "routable listeners are exactly 9444, 9445, 8080"
+# 443 replaces 8080 here for the same reason as above. Note this assertion was NOT protecting
+# anything while it named 8080: the step aborted at the /health probe several checks earlier, so
+# the boundary check never ran on any deploy since the TLS cutover.
+echo "routable listeners are exactly 9444, 9445, 443"
 
 echo "VERIFIED"
