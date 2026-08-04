@@ -4,7 +4,12 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.2.5] - 2026-08-03
+## [0.2.6] - 2026-08-04
+
+### Bug Fixes
+- **deploy:** Verify the gateway on 443 and count .dig capsules (#13)
+
+## [0.93.9] - 2026-08-03
 
 ### Bug Fixes
 - **infra:** Persist the origin certificate so a replacement never re-issues (#10)- **infra:** Contain the peek tree, not just check the file type (#12)
