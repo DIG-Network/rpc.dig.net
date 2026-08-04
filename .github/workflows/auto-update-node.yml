@@ -23,6 +23,12 @@
 # group below (dig_ecosystem#1938, where two pipelines deploying one service silently undid each
 # other for twelve minor versions).
 #
+# Be precise about what enforces that, because it is easy to assume more than is true: this job
+# assumes the SAME deploy role deploy.yml does, so IAM does not stop it from applying terraform.
+# What stops it is (a) the contents of this file, which a diff shows, and (b) the shared
+# concurrency group, which is mechanical. Adding a terraform step here would be a reviewable
+# change, not a permissions error — treat it as one.
+#
 # WHY IT BUMPS THE REPOSITORY VARIABLES TOO. DIG_NODE_VERSION is the bootstrap floor: what a fresh
 # instance installs. Updating the host without updating it would mean the next deploy silently
 # REVERTED the node (dig_ecosystem#2034). Both move in the same run, only after the host is
@@ -160,7 +166,11 @@ jobs:
           [ "$COUNT" = "1" ] || { echo "expected exactly one running node, found $COUNT: $IIDS" >&2; exit 1; }
 
           echo "id=$IIDS" >>"$GITHUB_OUTPUT"
-          echo "since=$(date -u '+%Y-%m-%d %H:%M:%S')" >>"$GITHUB_OUTPUT"
+          # `@<epoch>` rather than a formatted timestamp: `journalctl --since` parses a bare
+          # timestamp in the HOST's local zone, not the runner's. That happens to agree today
+          # because AL2023 defaults to UTC, but nothing pins it, and a host that ever moved off UTC
+          # would silently shift the peer-count window. Epoch form has no zone to disagree about.
+          echo "since=@$(date -u +%s)" >>"$GITHUB_OUTPUT"
           echo "node host: $IIDS"
 
       - name: install it on the host
@@ -236,13 +246,26 @@ jobs:
           WANT: ${{ steps.pick.outputs.version }}
         run: |
           set -euo pipefail
-          for _ in $(seq 1 20); do
+          for i in $(seq 1 20); do
+            # `|| true` is load-bearing, and this is the retry loop that most needs it. `curl -fsS`
+            # exits non-zero on any transport error or non-2xx, `pipefail` propagates that through
+            # `jq`, and the exit status of an assignment IS the status of its command substitution
+            # — so without it a single blip exits the step at iteration 1, with no output, and the
+            # twenty retries below never happen.
+            #
+            # That matters here more than anywhere else in this workflow: by this point the host
+            # has already been swapped, verified, and the DIG_NODE_* variables have moved. A
+            # transient blip would turn a SUCCESSFUL production update into a red nightly reporting
+            # nothing but an exit code. Same defect as update-node.sh's ORIGIN_HOST read; this is
+            # the one place the first sweep for it missed.
             SAW="$(curl -fsS --max-time 15 https://rpc.dig.net/ \
                      -H 'content-type: application/json' \
                      -d '{"jsonrpc":"2.0","id":1,"method":"dig.health"}' 2>/dev/null \
-                   | jq -r '.result.version // empty')"
-            [ "$SAW" = "$WANT" ] && { echo "rpc.dig.net reports $SAW"; exit 0; }
+                   | jq -r '.result.version // empty' || true)"
+            [ "$SAW" = "$WANT" ] && { echo "rpc.dig.net reports $SAW (attempt $i)"; exit 0; }
+            echo "attempt $i: rpc.dig.net reports '${SAW:-<no answer>}', wanted '$WANT'"
             sleep 15
           done
-          echo "rpc.dig.net reports '${SAW:-<no answer>}', wanted '$WANT'" >&2
+          echo "rpc.dig.net never reported '$WANT'. The host itself verified healthy, so check" >&2
+          echo "CloudFront and the origin hop before assuming the update failed." >&2
           exit 1

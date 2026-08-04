@@ -277,6 +277,7 @@ the only symptom you should see. Read the run's on-host output; it names which g
 | `ROLLED BACK` | the release installed but never served; the previous binary is back | the node is fine. Set `DIG_NODE_AUTOUPDATE=off` so the nightly stops retrying, and report the release |
 | `CRITICAL: rollback … did not restore service` | **the tier is down** | this is the one that needs a human — go to the host over SSM, check `journalctl -u dig-node -u rpc-gateway`, and use rollback option 1 |
 | `expected exactly one running node` | a deploy is mid-flight, or something else carries the node's tags | wait for the deploy, then re-run |
+| `rpc.dig.net never reported <version>`, after `VERIFIED` on the host | **the update SUCCEEDED**; the node is on the new release and the host verified it. Only the public hop disagrees | do not roll back. The variables have already moved and are correct. Check CloudFront and the origin hop — `curl -sI https://rpc.dig.net/` and the `node-rpc.dig.net` A record — then confirm with the `dig.health` one-liner below |
 
 Do not judge this by the workflow badge alone — judge the endpoint:
 

@@ -111,7 +111,6 @@ cp -a "$BIN" "$ROLLBACK"
 # `mv` within a filesystem is atomic, and safe against a running process: the executing node holds
 # its own inode, so nothing changes for it until it restarts.
 mv -f "$CANDIDATE" "$BIN"
-echo "$NEW_VERSION" >"$STAMP"
 
 restart_stack() {
   systemctl restart dig-node.service
@@ -154,6 +153,17 @@ await_healthy() {
 }
 
 if await_healthy "${NEW_VERSION#v}"; then
+  # Recorded only once the new binary is PROVEN to serve, and this ordering is deliberate.
+  #
+  # Written before the health wait, an interruption in between — an SSM execution timeout, a
+  # SIGTERM, the box rebooting — would leave a stamp naming a release nothing verified, while the
+  # workflow never reached the step that moves the repository variables. New binary, new stamp,
+  # old pin, no rollback: exactly the divergence SPEC §7.2 forbids, arrived at sideways.
+  #
+  # Written here, the same interruption leaves the stamp naming the OLD release, which is
+  # self-healing: the next run sees a version behind, installs again, and converges. Stale-old
+  # costs one redundant install. Stale-new is a silent lie that a re-run would no-op on.
+  echo "$NEW_VERSION" >"$STAMP"
   echo "UPDATED $CURRENT -> $NEW_VERSION"
   exit 0
 fi
@@ -162,6 +172,8 @@ echo "FAILED to come up on $NEW_VERSION; rolling back to $CURRENT" >&2
 journalctl -u dig-node -n 60 --no-pager >&2 || true
 
 mv -f "$ROLLBACK" "$BIN"
+# Idempotent now that the stamp only moves on success — it already says "$CURRENT". Kept as a
+# positive assertion of what is installed rather than a reliance on nothing else having touched it.
 echo "$CURRENT" >"$STAMP"
 restart_stack
 

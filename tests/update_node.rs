@@ -66,6 +66,32 @@ fn the_checksum_is_verified_before_anything_is_installed() {
     );
 }
 
+/// The recorded version must not move until the new binary is proven to serve.
+///
+/// This one is about the INTERRUPTED path, which no fake can stage: if the stamp is written
+/// straight after the swap, a kill between there and the health wait — an SSM execution timeout, a
+/// SIGTERM, a reboot — leaves a stamp naming a release nothing verified, while the workflow never
+/// reached the step that moves the repository variables. That is the pin/reality divergence
+/// SPEC §7.2 forbids. Written after the health gate, the same interruption leaves the stamp naming
+/// the OLD release, which the next run simply installs again.
+#[test]
+fn the_recorded_version_moves_only_after_the_node_is_proven_healthy() {
+    let src = script_source();
+    let swap = src.find(r#"mv -f "$CANDIDATE" "$BIN""#).expect("the swap");
+    let health = src
+        .find(r#"if await_healthy "${NEW_VERSION#v}""#)
+        .expect("the health gate");
+    // The rollback writes `"$CURRENT"`, so this find is unambiguously the success-path stamp.
+    let stamp = src
+        .find(r#"echo "$NEW_VERSION" >"$STAMP""#)
+        .expect("the stamp write");
+
+    assert!(
+        swap < health && health < stamp,
+        "the stamp must be written AFTER the health gate; got swap@{swap} health@{health} stamp@{stamp}"
+    );
+}
+
 /// A `.deb` URL bricks this node. Selection is what prevents it (see `src/release.rs`), and
 /// nothing in the script may reconstruct an artifact name of its own.
 #[test]
