@@ -165,3 +165,5 @@ runner, and the staged binary must answer `--version` on the host — before any
 The same distinction explains why the asset name is **constructed** (`dig-node-<v>-linux-arm64`)
 rather than searched for. A substring match on "arm64" also finds `dig-node_<v>_arm64.deb`, which
 is the right architecture, the right project, the right version — and unbootable as `/usr/local/bin/dig-node`.
+
+<!-- wip: #2034 deploy verify port derivation + no-replace instance -->
