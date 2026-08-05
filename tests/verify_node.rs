@@ -14,15 +14,12 @@
 //! describes without that machinery, and the real behavioural proof is the on-host run every deploy
 //! performs.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn script_source() -> String {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
-    std::fs::read_to_string(root.join(".github/verify-node.sh")).expect("read .github/verify-node.sh")
-}
-
-fn _repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    std::fs::read_to_string(root.join(".github/verify-node.sh"))
+        .expect("read .github/verify-node.sh")
 }
 
 /// `bash` rejects a function header ending in `\r`, and SSM runs this file with no cloud-init in the
@@ -77,7 +74,10 @@ fn no_hardcoded_gateway_port_literal_remains_in_a_probe_or_assertion() {
 #[test]
 fn the_health_probe_and_listener_boundary_are_intact() {
     let src = script_source();
-    assert!(src.contains("set -euo pipefail"), "the script must run under set -e");
+    assert!(
+        src.contains("set -euo pipefail"),
+        "the script must run under set -e"
+    );
     assert!(
         src.contains("\"${RESOLVE[@]}\" \"$GATEWAY/health\""),
         "the fatal /health probe against the derived port must remain"

@@ -166,4 +166,25 @@ The same distinction explains why the asset name is **constructed** (`dig-node-<
 rather than searched for. A substring match on "arm64" also finds `dig-node_<v>_arm64.deb`, which
 is the right architecture, the right project, the right version — and unbootable as `/usr/local/bin/dig-node`.
 
-<!-- wip: #2034 deploy verify port derivation + no-replace instance -->
+## A routine deploy must not replace the node, and the gateway port lives in exactly one place (#2034)
+
+Two deploy defects with the same shape — a value copied instead of derived.
+
+The post-deploy `verify-node.sh` hardcoded the gateway port (probing `8080`, later a hardcoded
+`443`) while the gateway actually binds whatever `var.gateway_port` (canonically `443`) puts into the
+unit's `GATEWAY_LISTEN`. A second literal copy is a drift waiting to happen, and it happened: every
+healthy deploy reported RED. The port is now DERIVED on-host with
+`systemctl show rpc-gateway.service --property=Environment` → parse `GATEWAY_LISTEN` → port after the
+last colon. The canonical port lives once, in terraform; the code default `0.0.0.0:8080` is only the
+dev fallback for when `GATEWAY_LISTEN` is unset, never the deployed value.
+
+Separately, the gateway binary's SHA is templated into `user_data`, and a build is not
+bit-reproducible, so even a rebuild of unchanged source changed `user_data` and — with
+`user_data_replace_on_change = true` — Terminate+RunInstances'd the box on every deploy: ~2.5 min
+public outage, plus the certificate-reissue failure mode that cost ~21h (#2037). The fix is the same
+in-place mechanism the nightly node update already uses: terraform now holds the instance still
+(`user_data_replace_on_change = false` + `ignore_changes = [user_data_base64]`), and `deploy.yml`
+installs the freshly-built, checksum-verified gateway over SSM (`update-gateway.sh`, with a rollback
+if it fails to serve). `user_data` remains the checksum-pinned bootstrap floor a FRESH instance
+installs; a deliberate `terraform taint` must be followed by a deploy so the floor and the running
+gateway reconverge.

@@ -69,11 +69,24 @@ and `:ref:refs/tags/*`.
 Never widen that to a bare `repo:…:*`. The `pull_request` subject matches it, which would let a
 workflow running on a **fork's** pull request assume the deploy role.
 
-### Every deploy replaces the instance — on purpose
+### A routine deploy does NOT replace the instance (dig_ecosystem#2034)
 
-The gateway binary's SHA-256 is baked into `user_data`, so a new release changes `user_data`, which
-replaces the EC2 instance. Immutable infrastructure, with the cost you would expect: a few minutes
-of downtime while the new host boots, re-installs `dig-node`, and re-establishes the S3 mount.
+The gateway binary's SHA-256 is baked into `user_data`, and a build is not bit-reproducible, so a
+new release always changes `user_data`. It used to replace the whole EC2 instance for that
+(`user_data_replace_on_change = true`): ~2.5 min of public outage per deploy, a `dnf -y update`
+against an unpinned input, and the certificate-restore path exercised on every release. Terraform now
+leaves the instance **still** — `user_data_replace_on_change = false` and
+`ignore_changes = [user_data_base64]` on `aws_instance.node` — and `deploy.yml` installs the
+freshly-built, checksum-verified gateway **in place** over SSM (`.github/update-gateway.sh`), swapping
+one binary and restarting `rpc-gateway`, with a rollback to the previous binary if the new one does
+not serve. This is the same in-place mechanism the nightly `dig-node` update uses.
+
+`user_data` remains the **checksum-pinned bootstrap floor** a FRESH instance installs at boot. Because
+it is ignored for diffing, a **deliberate** replacement (`terraform taint aws_instance.node`, or an AMI
+refresh) boots from the floor's value at create time and may install an older gateway — so **follow a
+deliberate replacement with a deploy** (or a manual `update-gateway.sh` run) to reconverge the running
+gateway with the latest release. Manual rollback of a healthy-but-wrong gateway build is a rename:
+`mv /usr/local/bin/rpc-gateway.rollback /usr/local/bin/rpc-gateway && systemctl restart rpc-gateway`.
 
 What must **not** be replaced is `aws_ebs_volume.state`, because it holds the node's peer identity.
 Its AZ is therefore read from the subnet, never from `aws_instance.node.availability_zone` — the
@@ -105,11 +118,12 @@ boot -> dig-origin-cert ensure
 `/usr/local/sbin/dig-origin-cert` is installed verbatim from `infra/dig-origin-cert.sh`, and
 `certbot-renew.timer` runs it twice daily.
 
-**Editing the helper replaces the instance — including a comment-only edit.** Its SHA-256 is pinned
-into `user_data` by `filesha256`, and `user_data_replace_on_change = true`, so any byte that changes
-in `infra/dig-origin-cert.sh` changes `user_data` and recycles the node. That is correct — the host
-must run the version that was reviewed — but it means a typo fix in a comment costs a replacement.
-Batch helper edits rather than trickling them.
+**Editing the helper changes `user_data` but no longer recycles the node.** Its SHA-256 is pinned into
+`user_data` by `filesha256`, so any byte that changes in `infra/dig-origin-cert.sh` changes
+`user_data` — but `user_data_base64` is now ignored for diffing (above), so a running instance is left
+untouched and keeps the previously-installed helper until it is next replaced. If a helper change must
+reach the running host immediately, install it there deliberately (over SSM, the same way the gateway
+is) or `terraform taint aws_instance.node` to rebuild from the new floor.
 
 **A publish failure is degraded, not down.** If `put-secret-value` fails, the host keeps serving and
 logs a `WARNING` naming the cost: the durable copy still holds the previous certificate, so the next

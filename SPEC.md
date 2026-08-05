@@ -437,6 +437,19 @@ Nothing about this may introduce a second writer of the deployment (§7.1's cert
 applies to the whole stack): exactly one mechanism applies infrastructure, and an update path that
 changes what runs on the host MUST be mutually exclusive with it.
 
+### 7.3 A routine deploy MUST NOT replace the serving host
+
+Advancing the gateway is a hot path: it happens on every release, in front of live readers. A routine
+deploy MUST NOT terminate and recreate the instance — a replacement incurs public downtime, re-runs an
+unpinned host update, and re-exercises the certificate-restore path whose failure took the tier down
+for ~21h (§7.1, dig_ecosystem#2034 / #2037). The infrastructure MUST leave the running instance
+undisturbed on a per-release binary change, and the new gateway binary MUST instead be applied **in
+place**: fetched, its SHA-256 verified against the published bytes **before** it is installed, proven
+loadable on the host's architecture, swapped, and the unit restarted — judged on the gateway serving
+over its real TLS origin, and **rolled back** to the previous binary if it does not. The deployed
+`user_data` remains the checksum-pinned bootstrap floor a *fresh* instance installs; a deliberate host
+replacement MUST be reconciled back to the latest release (a following deploy or an in-place install).
+
 ---
 
 ## 8. Observability

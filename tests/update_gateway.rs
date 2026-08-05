@@ -62,7 +62,9 @@ fn success_is_judged_on_serving_not_on_installing() {
     let src = script_source();
     let swap = src.find(r#"mv -f "$CANDIDATE" "$BIN""#).expect("the swap");
     let gate = src.find("if await_serving; then").expect("the health gate");
-    let ok = src.find("INSTALLED gateway $NEW_SHA").expect("the success message");
+    let ok = src
+        .find("INSTALLED gateway $NEW_SHA")
+        .expect("the success message");
     assert!(
         swap < gate && gate < ok,
         "success must follow a health gate; got swap@{swap} gate@{gate} ok@{ok}"
@@ -262,7 +264,10 @@ fi
     }
 
     fn sha256_of(path: &Path) -> String {
-        let out = Command::new("sha256sum").arg(path).output().expect("sha256sum");
+        let out = Command::new("sha256sum")
+            .arg(path)
+            .output()
+            .expect("sha256sum");
         String::from_utf8_lossy(&out.stdout)
             .split_whitespace()
             .next()
@@ -288,7 +293,11 @@ fi
         let run = host.run("rpc-gateway-aarch64", &sha);
 
         assert!(run.succeeded(), "update failed:\n{}", run.log());
-        assert_eq!(host.installed_bytes(), GOOD, "the new binary was not installed");
+        assert_eq!(
+            host.installed_bytes(),
+            GOOD,
+            "the new binary was not installed"
+        );
         assert_eq!(host.read("serving").trim(), "1");
         assert!(run.log().contains("INSTALLED gateway"), "{}", run.log());
     }
@@ -304,8 +313,16 @@ fi
         let run = host.run("rpc-gateway-aarch64", &wrong);
 
         assert!(!run.succeeded(), "a bad checksum must fail the update");
-        assert_eq!(host.installed_bytes(), old, "the binary was replaced despite a bad checksum");
-        assert_eq!(host.systemctl_log().matches("restart").count(), 0, "the service was restarted");
+        assert_eq!(
+            host.installed_bytes(),
+            old,
+            "the binary was replaced despite a bad checksum"
+        );
+        assert_eq!(
+            host.systemctl_log().matches("restart").count(),
+            0,
+            "the service was restarted"
+        );
     }
 
     /// A checksum proves provenance, not that the file runs here. This host is Graviton; a non-ELF
@@ -333,13 +350,20 @@ fi
 
         let run = host.run("rpc-gateway-aarch64", &sha);
 
-        assert!(!run.succeeded(), "a gateway that never serves must fail loudly");
+        assert!(
+            !run.succeeded(),
+            "a gateway that never serves must fail loudly"
+        );
         assert!(
             run.log().contains("ROLLED BACK") || run.log().contains("CRITICAL"),
             "the failure was silent:\n{}",
             run.log()
         );
-        assert_eq!(host.installed_bytes(), old, "the broken binary was left in place");
+        assert_eq!(
+            host.installed_bytes(),
+            old,
+            "the broken binary was left in place"
+        );
         assert_eq!(host.read("serving").trim(), "1", "the tier was left down");
     }
 
@@ -353,7 +377,11 @@ fi
         let run = host.run("rpc-gateway-aarch64", &sha);
 
         assert!(run.succeeded(), "{}", run.log());
-        assert_eq!(host.systemctl_log().matches("restart").count(), 0, "a no-op restarted the gateway");
+        assert_eq!(
+            host.systemctl_log().matches("restart").count(),
+            0,
+            "a no-op restarted the gateway"
+        );
         assert!(run.log().contains("nothing to do"), "{}", run.log());
     }
 
@@ -367,7 +395,11 @@ fi
 
         assert!(host.run("rpc-gateway-aarch64", &sha).succeeded());
 
-        assert_eq!(host.read("usrbin/rpc-gateway.rollback"), old, "no rollback copy was kept");
+        assert_eq!(
+            host.read("usrbin/rpc-gateway.rollback"),
+            old,
+            "no rollback copy was kept"
+        );
     }
 
     /// Nothing half-installed may be left lying in the binary directory on any path.
