@@ -4,7 +4,12 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.4.0] - 2026-08-05
+## [0.4.1] - 2026-08-05
+
+### Bug Fixes
+- **deploy:** Verify the port the gateway actually binds + stop per-deploy instance replacement (#16)
+
+## [0.98.0] - 2026-08-05
 
 ### Features
 - **server:** Serve the path-addressed anonymous content read (/stores/*/content/*) (#15)
