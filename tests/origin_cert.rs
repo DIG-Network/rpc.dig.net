@@ -357,6 +357,31 @@ done
             assert!(packed.success(), "could not build the test archive");
         }
 
+        /// Pack whatever `build` leaves in a fresh directory into the *stored secret*, the same
+        /// way `save` would: GNU `tar --sparse` (so a sparse member survives as sparse) then
+        /// base64. `build` runs with `$DIR` at that directory and `$HOST` at the certificate
+        /// hostname. This is how a peek-path test hands the helper an archive that no honest
+        /// `save` would ever produce — a sparse member, an oversize member, a symlink loop.
+        fn store_hostile_archive(&self, build: &str) {
+            let dir = self.path("hostile-peek");
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let script = format!(
+                "set -e; DIR='{}'; HOST='{}'; {}; \
+                 tar --sparse -czf - -C \"$DIR\" . | base64 -w0 > '{}'",
+                dir.display(),
+                HOST,
+                build,
+                self.stored_secret().display()
+            );
+            let status = Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .status()
+                .expect("packing the hostile peek archive");
+            assert!(status.success(), "could not build the hostile peek archive");
+        }
+
         /// Put a certificate valid for `days` into the *stored secret*, and leave the disk empty
         /// — the state a replacement instance boots into.
         fn given_a_certificate_only_in_the_secret(&self, days: u32) {
@@ -367,6 +392,13 @@ done
         }
 
         fn run(&self, subcommand: &str) -> Run {
+            self.run_with_env(subcommand, &[])
+        }
+
+        /// Drive the helper, layering `extra` env on top of the standard sandbox set (so a single
+        /// test can, e.g., tighten `DIG_ORIGIN_CERT_OPENSSL_TIMEOUT` to prove the openssl bound
+        /// actually fires).
+        fn run_with_env(&self, subcommand: &str, extra: &[(&str, &str)]) -> Run {
             self.install_cert_writer();
             let script = repo_root().join("infra/dig-origin-cert.sh");
             let path = format!(
@@ -374,7 +406,8 @@ done
                 self.path("bin").display(),
                 std::env::var("PATH").unwrap_or_default()
             );
-            let output = Command::new("bash")
+            let mut command = Command::new("bash");
+            command
                 .arg(&script)
                 .arg(subcommand)
                 .env("PATH", path)
@@ -391,7 +424,11 @@ done
                 // Restore imposes ownership on the state it installs rather than trusting the
                 // archive's. Tests are not root, so they name themselves.
                 .env("DIG_ORIGIN_CERT_OWNER", current_owner())
-                .env("AWS_DEFAULT_REGION", "us-east-1")
+                .env("AWS_DEFAULT_REGION", "us-east-1");
+            for (key, value) in extra {
+                command.env(key, value);
+            }
+            let output = command
                 .output()
                 .unwrap_or_else(|e| panic!("running {}: {e}", script.display()));
             Run {
@@ -1455,6 +1492,168 @@ done
         assert!(
             !sandbox.secret_holds_a_certificate(),
             "an empty state directory was published over the stored certificate"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The PEEK path is hostile-archive territory too (dig_ecosystem#2064).
+    //
+    // `renew` reconciles the durable copy by PEEKING at the stored secret
+    // (`stored_certificate_fingerprint`): it unpacks the payload into $WORK and, on the code that
+    // shipped, ran `openssl x509` over a member of it. Nothing ever fed that path a hostile
+    // archive — every earlier hostile test drove `restore`. So the sparse-member DoS lived here
+    // unguarded: a 304-byte secret restores a `live/<host>/cert.pem` whose APPARENT size is 8 TB
+    // and whose blocks are zero. It slips past the decompression ceiling (the size is a header
+    // field, not real bytes), the name guard, and the type/setuid/symlink checks, then `openssl`
+    // streams terabytes of holes for ~104 hours — and the unit that calls this is Type=oneshot, so
+    // the renewal timer wedges permanently.
+    //
+    // These drive `renew` so the peek runs, and assert on the SPECIFIC guard message rather than on
+    // the outcome: a peek that returns nothing looks identical whether a guard rejected it or
+    // `openssl` merely failed, so the message is what proves WHICH guard fired — and what turns
+    // red when that guard is reverted.
+
+    /// Reach the peek: a valid certificate on disk, nothing due, so `renew` reconciles against the
+    /// stored secret instead of renewing.
+    fn renew_over_hostile_secret(build: &str) -> (Sandbox, Run) {
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_on_disk(90);
+        sandbox.store_hostile_archive(build);
+        let run = sandbox.run("renew");
+        (sandbox, run)
+    }
+
+    /// **A sparse 8 TB member is rejected by `staged_tree_is_contained`, before any openssl read.**
+    ///
+    /// The apparent-size guard is the primary control: it judges the tree once and refuses the
+    /// member six orders of magnitude over the ceiling, so nothing ever opens the file. The peek
+    /// still succeeds (it falls back to republishing the good on-disk certificate) — what must not
+    /// happen is the read.
+    #[test]
+    fn a_sparse_member_is_refused_on_the_peek_path_before_it_is_read() {
+        let (_sandbox, run) = renew_over_hostile_secret(
+            "mkdir -p \"$DIR/live/$HOST\"; truncate -s 8T \"$DIR/live/$HOST/cert.pem\"",
+        );
+
+        let run = run.expect_success();
+        assert!(
+            run.stderr().contains("apparent size"),
+            "the sparse member was not refused by the apparent-size guard — it reached a reader:\n{}",
+            run.stderr()
+        );
+    }
+
+    /// **An oversize but non-sparse member is refused too**, and by the PER-FILE bound rather than
+    /// the whole-tree decompression ceiling: at 2 MiB it sits comfortably under the 8 MiB tar
+    /// ceiling, so only a bound on the individual file can catch it. That is the case the tree-wide
+    /// limit cannot see.
+    #[test]
+    fn an_oversize_member_under_the_tar_ceiling_is_still_refused() {
+        let (_sandbox, run) = renew_over_hostile_secret(
+            "mkdir -p \"$DIR/live/$HOST\"; \
+             head -c $((2 * 1024 * 1024)) </dev/zero >\"$DIR/live/$HOST/cert.pem\"",
+        );
+
+        let run = run.expect_success();
+        assert!(
+            run.stderr().contains("apparent size"),
+            "a 2 MiB member slipped past the per-file size bound:\n{}",
+            run.stderr()
+        );
+    }
+
+    /// **A symlink loop is rejected — the containment check fails CLOSED.**
+    ///
+    /// Resolving the loop makes `realpath` fail; an unresolvable link must be treated as a
+    /// containment violation, never silently deemed contained. The old lexical `realpath -m`
+    /// returned a tidy string for a loop that matched none of the escape arms, so it was accepted.
+    #[test]
+    fn a_symlink_loop_is_refused_on_the_peek_path() {
+        let (_sandbox, run) = renew_over_hostile_secret(
+            "mkdir -p \"$DIR/live/$HOST\"; \
+             ln -s loopb \"$DIR/live/loopa\"; ln -s loopa \"$DIR/live/loopb\"",
+        );
+
+        let run = run.expect_success();
+        assert!(
+            run.stderr().contains("does not resolve inside the state directory"),
+            "a symlink loop was not refused — the containment check failed OPEN:\n{}",
+            run.stderr()
+        );
+    }
+
+    /// The boot path must not be able to hang unboundedly on a hostile restore.
+    ///
+    /// `dig-origin-cert ensure` runs INLINE in cloud-init as root; only the renewal *unit* had a
+    /// TimeoutStartSec. A payload crafted to make a restored file stream forever would wedge the
+    /// whole bootstrap before the gateway is ever enabled. The inline call must be wrapped in a
+    /// `timeout`, and a timeout must fail the boot loudly (`set -euxo` aborts) rather than proceed
+    /// without a certificate.
+    #[test]
+    fn the_boot_path_bounds_the_inline_ensure() {
+        let script = user_data();
+        assert!(
+            script.contains("timeout 20m /usr/local/sbin/dig-origin-cert ensure"),
+            "the inline `dig-origin-cert ensure` must run under a `timeout` so a hostile restore \
+             cannot wedge the boot forever (dig_ecosystem#2064)"
+        );
+    }
+
+    /// **The openssl bound actually FIRES — a slow read is killed, not waited on.**
+    ///
+    /// The apparent-size guard stops the sparse member before openssl ever opens it, so the timeout
+    /// is defense-in-depth and cannot be exercised through a permitted input. This drives the
+    /// mechanism directly: a stand-in `openssl` that sleeps far longer than the bound, a tight
+    /// `DIG_ORIGIN_CERT_OPENSSL_TIMEOUT`, and `check` — which reads the certificate through
+    /// `run_openssl`. With the bound in place the call is killed and `check` returns in a couple of
+    /// seconds; with a bare `openssl` it would block for the full sleep. Asserting a wall-clock
+    /// ceiling is what makes "bounded" a checkable claim: revert `run_openssl` to a bare `openssl`
+    /// and this blocks past the ceiling and fails.
+    #[test]
+    fn a_slow_openssl_read_is_killed_by_the_bound() {
+        use std::time::Instant;
+
+        let sandbox = Sandbox::new();
+        sandbox.given_a_certificate_on_disk(90);
+        // Shadow openssl with one that hangs. It is installed AFTER the real certificate is built,
+        // so `make-cert`'s own `openssl req` used the genuine tool.
+        sandbox.write_executable("openssl", "#!/usr/bin/env bash\nsleep 30\n");
+
+        let started = Instant::now();
+        let run = sandbox.run_with_env("check", &[("DIG_ORIGIN_CERT_OPENSSL_TIMEOUT", "2")]);
+        let elapsed = started.elapsed();
+
+        // A killed read cannot yield a usable pair, so `check` fails — the point is that it fails
+        // PROMPTLY rather than blocking for the 30s sleep.
+        run.expect_failure();
+        assert!(
+            elapsed.as_secs() < 15,
+            "check took {elapsed:?}; the openssl read was not time-bounded (the 30s sleep ran to \
+             completion), so a hostile file could wedge this call as root"
+        );
+    }
+
+    /// Every openssl call that reads restored or stored bytes must be time-bounded.
+    ///
+    /// A bare `openssl` over an attacker-influenceable file is the DoS: on a sparse member it
+    /// churns for hours as root. The single bounded invocation lives in `run_openssl`; every reader
+    /// must go through it, so no bare `openssl ...` command may read a certificate directly.
+    #[test]
+    fn every_openssl_read_is_time_bounded() {
+        let helper = read("infra/dig-origin-cert.sh");
+        let offenders: Vec<&str> = helper
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .filter(|line| line.contains("openssl"))
+            // The one place a literal `openssl` is invoked — under the timeout.
+            .filter(|line| !line.contains("timeout \"$OPENSSL_READ_TIMEOUT\" openssl"))
+            // Everyone else must call the bounded wrapper.
+            .filter(|line| !line.contains("run_openssl"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a bare `openssl` reads restored bytes without a timeout — it must use run_openssl \
+             (dig_ecosystem#2064): {offenders:?}"
         );
     }
 }

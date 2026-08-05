@@ -293,7 +293,23 @@ UNIT
 while IFS='=' read -r key value; do
   case "$key" in DIG_ORIGIN_CERT_* | AWS_DEFAULT_REGION) export "$key=$value" ;; esac
 done </etc/dig-origin-cert.env
-/usr/local/sbin/dig-origin-cert ensure
+# Bounded, and it must FAIL LOUD (dig_ecosystem#2064). `ensure` restores an attacker-influenceable
+# payload and hands it to openssl/certbot as ROOT, inline in cloud-init. certbot-renew.service caps
+# the twice-daily run with TimeoutStartSec, but this boot call had no bound at all, so a payload
+# crafted to make a restored file stream forever (a sparse cert.pem measured at ~104h) would wedge
+# the whole bootstrap before the gateway is ever enabled — read tier down, and every replacement
+# restoring the same secret re-wedges. The in-script guards now reject that payload, and this is the
+# belt over those braces. 20 minutes is far beyond a real dns-01 issuance/renewal (~1-2 min) and
+# matches the renewal unit's bound. On timeout `timeout` exits non-zero and `set -e` aborts the
+# bootstrap: cloud-init records the failure and the gateway is never enabled. That is the correct
+# choice — a boot that cannot establish a certificate must fail visibly, never proceed and serve a
+# broken or certificate-less gateway (see the no-certificate gate below, which does the same).
+if ! timeout 20m /usr/local/sbin/dig-origin-cert ensure; then
+  echo "FATAL: 'dig-origin-cert ensure' failed or exceeded its 20-minute bound." >&2
+  echo "Refusing to continue: the origin cannot come up without a certificate, and an unbounded" >&2
+  echo "restore of a hostile payload must not wedge the boot (dig_ecosystem#2064)." >&2
+  exit 1
+fi
 
 # The certaccess group and the gateway's read access are applied by the helper itself, on every
 # path that changes the certificate — including the twice-daily renewal, which this bootstrap

@@ -82,6 +82,29 @@ readonly MAX_ENCODED_BYTES=60000
 # deliberately compressible payload can do to the root filesystem. Real state is ~50 KB.
 readonly MAX_DECOMPRESSED_BYTES=$((8 * 1024 * 1024))
 
+# The largest APPARENT size any single restored file may claim (dig_ecosystem#2064). The
+# decompressed-size ceiling above bounds the whole tar, but a GNU-sparse member declares an
+# enormous apparent size in its header while occupying almost no bytes on the wire and none on
+# disk — a 304-byte secret can restore a `live/<host>/cert.pem` whose apparent size is 8 TB and
+# whose block count is zero. It passes MAX_DECOMPRESSED_BYTES, the name guard and the
+# type/setuid/symlink checks, and only reveals itself when something STREAMS it: `openssl x509`
+# then reads terabytes of holes at memory speed for hours, wedging the boot path forever. Bounding
+# apparent size makes "no file here is absurdly large" a property of the TREE, checked once before
+# anything reads a byte, rather than a hope about each consumer. Every legitimate artifact is tiny:
+# a single PEM (cert/privkey/fullchain/chain) is ~8.5 KB, a full RSA-4096 chain with two
+# intermediates well under 30 KB, and certbot keeps each generation as its OWN small file rather
+# than one growing blob. 1 MiB is 30-100x the largest real file yet six orders of magnitude below
+# the sparse member it must catch, so it can only ever fire on an abusive payload.
+readonly MAX_MEMBER_APPARENT_BYTES=$((1024 * 1024))
+
+# Every `openssl` call that reads restored or stored bytes runs under this wall-clock bound
+# (dig_ecosystem#2064). Parsing a real certificate is milliseconds; a call that takes seconds is
+# reading something that is not a certificate — a corrupt file, or the sparse member above sneaking
+# past every other guard. A few seconds is generous for the honest case and turns "churn for hours
+# as root" into a bounded, recoverable failure. Overridable only so a focused test can drive the
+# bound; production never sets it.
+readonly OPENSSL_READ_TIMEOUT="${DIG_ORIGIN_CERT_OPENSSL_TIMEOUT:-5}"
+
 # How a restore attempt ended. Three outcomes and not two, because ABSENT and FAILED demand
 # OPPOSITE responses: one may lead to an order, the other must never.
 readonly RESTORE_OK=0
@@ -112,6 +135,17 @@ die() {
   exit 1
 }
 
+# Run openssl under OPENSSL_READ_TIMEOUT so no invocation that touches restored or stored bytes can
+# stream a hostile file indefinitely (dig_ecosystem#2064). `timeout` propagates openssl's own exit
+# code on success and returns non-zero (124) when it has to kill it, so every caller's existing
+# `|| return 1` / `>/dev/null 2>&1` handling treats a timed-out read exactly as it treats a parse
+# failure: the file is not a usable certificate. EVERY openssl call in this script that reads a
+# certificate or key goes through here — a bare `openssl` reading restored bytes is a regression the
+# tests guard against.
+run_openssl() {
+  timeout "$OPENSSL_READ_TIMEOUT" openssl "$@"
+}
+
 # --- Reading the certificate on disk -----------------------------------------------------------
 
 # A certificate and a key that parse, and that belong to each other.
@@ -122,8 +156,8 @@ die() {
 # "there is a usable certificate here" an honest claim.
 pem_pair_is_usable() {
   local dir="$1" cert_pubkey key_pubkey
-  cert_pubkey="$(openssl x509 -in "$dir/fullchain.pem" -noout -pubkey 2>/dev/null)" || return 1
-  key_pubkey="$(openssl pkey -in "$dir/privkey.pem" -pubout 2>/dev/null)" || return 1
+  cert_pubkey="$(run_openssl x509 -in "$dir/fullchain.pem" -noout -pubkey 2>/dev/null)" || return 1
+  key_pubkey="$(run_openssl pkey -in "$dir/privkey.pem" -pubout 2>/dev/null)" || return 1
   [ -n "$cert_pubkey" ] && [ "$cert_pubkey" = "$key_pubkey" ]
 }
 
@@ -133,22 +167,22 @@ certificate_is_present() {
 
 # True while the certificate has not yet expired — the bar for "can still serve traffic".
 certificate_is_valid_now() {
-  openssl x509 -in "$LIVE_DIR/cert.pem" -noout -checkend 0 >/dev/null 2>&1
+  run_openssl x509 -in "$LIVE_DIR/cert.pem" -noout -checkend 0 >/dev/null 2>&1
 }
 
 # True while the certificate has more than RENEW_WITHIN_DAYS of life left.
 certificate_is_fresh() {
-  openssl x509 -in "$LIVE_DIR/cert.pem" -noout \
+  run_openssl x509 -in "$LIVE_DIR/cert.pem" -noout \
     -checkend "$((RENEW_WITHIN_DAYS * 86400))" >/dev/null 2>&1
 }
 
 certificate_expiry() {
-  openssl x509 -in "$LIVE_DIR/cert.pem" -noout -enddate 2>/dev/null || echo "notAfter=unknown"
+  run_openssl x509 -in "$LIVE_DIR/cert.pem" -noout -enddate 2>/dev/null || echo "notAfter=unknown"
 }
 
 # A stable identity for "which certificate is this", used to tell a real renewal from a no-op.
 certificate_fingerprint() {
-  openssl x509 -in "$LIVE_DIR/cert.pem" -noout -fingerprint -sha256 2>/dev/null || echo absent
+  run_openssl x509 -in "$LIVE_DIR/cert.pem" -noout -fingerprint -sha256 2>/dev/null || echo absent
 }
 
 # The gateway runs unprivileged, so it needs group read on the live certificate — without opening
@@ -280,12 +314,34 @@ staged_tree_is_contained() {
     return 1
   fi
 
+  # No single file may claim an absurd APPARENT size (dig_ecosystem#2064). `find -size` reads the
+  # size from the inode, so a fully-sparse member — real bytes zero, header size 8 TB — is caught
+  # HERE, before `pem_pair_is_usable` or the peek's `openssl` ever opens it. This is the primary
+  # control for the sparse-member DoS: it makes containment a property of the tree checked once,
+  # not a race every reader has to win. The `+Nc` form matches strictly-greater-than N bytes.
+  offender="$(find "$root" -type f -size "+${MAX_MEMBER_APPARENT_BYTES}c" -print -quit)"
+  if [ -n "$offender" ]; then
+    log "the stored archive contains a file whose apparent size exceeds" \
+      "$MAX_MEMBER_APPARENT_BYTES bytes: $offender"
+    return 1
+  fi
+
   while IFS= read -r link; do
-    # Resolve the LINK, never `dirname + readlink`. Reconstructing the path that way turns an
-    # absolute target into `$STAGING/live//etc/shadow`, and realpath then collapses the double
-    # slash to something inside the tree — so `-> /etc/shadow` was read as `live/etc/shadow` and
-    # accepted, while the far more exotic `-> ../../../etc/shadow` was correctly rejected.
-    target="$(realpath -m --relative-to="$root" "$link")"
+    # Resolve the LINK itself, never `dirname + readlink` (which turned an absolute `-> /etc/shadow`
+    # into `$STAGING/live//etc/shadow` and let realpath collapse the double slash back inside the
+    # tree). This pass RESOLVES symlinks rather than staying lexical, so an unresolvable link — a
+    # loop, or a target whose path cannot be walked — makes realpath fail instead of returning a
+    # tidy string. certbot's own `live/` entries are relative and resolve to files inside the tree,
+    # so they still pass; only escapes and unresolvable links are refused.
+    #
+    # FAIL CLOSED (dig_ecosystem#2064). An empty or errored realpath used to match none of the arms
+    # below and was therefore deemed CONTAINED — a symlink loop slipped straight through. An
+    # unresolvable link is treated as a containment violation now, because "we could not tell where
+    # this points" must never read as "it points somewhere safe".
+    if ! target="$(realpath --relative-to="$root" "$link" 2>/dev/null)" || [ -z "$target" ]; then
+      log "the stored archive has a symlink that does not resolve inside the state directory: $link"
+      return 1
+    fi
     case "$target" in
     /* | .. | ../*)
       log "the stored archive has a symlink pointing outside the state directory: $link"
@@ -660,7 +716,7 @@ stored_certificate_fingerprint() {
   staged_tree_is_contained "$peek" || return 1
 
   [ -f "$peek/live/$PEER_HOST/cert.pem" ] || return 1
-  openssl x509 -in "$peek/live/$PEER_HOST/cert.pem" -noout -fingerprint -sha256 2>/dev/null
+  run_openssl x509 -in "$peek/live/$PEER_HOST/cert.pem" -noout -fingerprint -sha256 2>/dev/null
 }
 
 # What a failed publish actually costs, said once, because all three callers must say the same
