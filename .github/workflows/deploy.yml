@@ -119,6 +119,32 @@ jobs:
             -var="dig_node_artifact_url=${{ vars.DIG_NODE_ARTIFACT_URL }}" \
             -var="dig_node_sha256=${{ vars.DIG_NODE_SHA256 }}"
 
+      # Apply the freshly-built gateway IN PLACE. Terraform no longer replaces the instance on a
+      # user_data (SHA) change (infra/node.tf), so the apply above did not put the new binary on the
+      # host — this does, over SSM, checksum-verified, with a rollback if it fails to serve
+      # (.github/update-gateway.sh). On a fresh instance user_data already installed exactly these
+      # bytes at boot, so the script's SHA short-circuit makes this a no-op. This is the same in-place
+      # mechanism the nightly node update uses; it keeps this deploy from ever recycling the box
+      # (dig_ecosystem#2034).
+      - name: install the gateway on the host in place
+        env:
+          TAG: ${{ vars.DIG_NODE_VERSION }}
+          SHA: ${{ steps.art.outputs.sha }}
+        run: |
+          set -euo pipefail
+          IID="$(terraform -chdir=infra output -raw node_instance_id)"
+          URL="https://github.com/${{ github.repository }}/releases/download/$TAG/rpc-gateway-aarch64"
+
+          # Re-assert the shape at the boundary — last thing between a value and root execution on a
+          # public-facing host.
+          [[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "bad sha: $SHA" >&2; exit 1; }
+          [[ "$URL" =~ ^https://github\.com/DIG-Network/rpc\.dig\.net/releases/download/v[0-9.]+/rpc-gateway-aarch64$ ]] \
+            || { echo "bad url: $URL" >&2; exit 1; }
+
+          PRELUDE="$(printf 'export NEW_URL=%q NEW_SHA=%q' "$URL" "$SHA")"
+          PARAMS="$(jq -Rs --arg prelude "$PRELUDE" '{commands: [$prelude, .]}' .github/update-gateway.sh)"
+          .github/run-on-host.sh "$IID" "$PARAMS" 900
+
       # Prove it, do not assume it. A green apply is not a serving node.
       #
       # Verification runs ON the host over SSM, not by curling from this runner. That is not a

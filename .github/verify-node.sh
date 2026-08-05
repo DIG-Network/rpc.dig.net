@@ -31,16 +31,26 @@ echo "capsules visible: $CAPSULES"
 [ "$CAPSULES" -gt 0 ] || { echo "FAIL: the capsule mount is a mountpoint but exposes no capsules" >&2; exit 1; }
 
 echo "--- the gateway answers ---"
-# The gateway terminates TLS on 443 (GATEWAY_LISTEN=0.0.0.0:443); it has not served plaintext 8080
-# since that cutover, so probing 8080 failed on every healthy deploy and reported the whole run RED
-# (dig_ecosystem#2034). A verification step that is always red is worse than none — it trains the
-# operator to ignore a genuine failure, and this repo has had one.
+# The gateway port is DERIVED from the running unit, never hardcoded here. The unit sets
+# GATEWAY_LISTEN=0.0.0.0:<port> (infra/user_data.sh.tftpl, from var.gateway_port, canonically 443),
+# so reading it back is the one source of truth: a second literal copy is exactly what drifted when
+# the deploy moved to TLS-on-443 while this file still probed 8080, turning every healthy deploy RED
+# (dig_ecosystem#2034). `systemctl show -p Environment` prints the unit's environment as a
+# space-separated list; pull GATEWAY_LISTEN out of it and take the port after the last colon.
+GATEWAY_LISTEN="$(systemctl show rpc-gateway.service --property=Environment --value 2>/dev/null \
+  | tr ' ' '\n' | sed -n 's/^GATEWAY_LISTEN=//p' | head -1)"
+[ -n "$GATEWAY_LISTEN" ] || { echo "FAIL: rpc-gateway has no GATEWAY_LISTEN in its environment" >&2; exit 1; }
+GATEWAY_PORT="${GATEWAY_LISTEN##*:}"
+[[ "$GATEWAY_PORT" =~ ^[0-9]+$ ]] || { echo "FAIL: could not derive a port from GATEWAY_LISTEN=$GATEWAY_LISTEN" >&2; exit 1; }
+echo "gateway listens on $GATEWAY_LISTEN (derived port $GATEWAY_PORT)"
 #
-# `--resolve` pins the real certificate name to the loopback address, so this still validates the
-# cert chain the public depends on rather than skipping verification with `-k`. A verify step is
-# the right place to catch an expired or misissued cert (see #2037, which took the tier down ~21h).
-GATEWAY="https://node-rpc.dig.net"
-RESOLVE=(--resolve "node-rpc.dig.net:443:127.0.0.1")
+# `--resolve` pins the real certificate name to the loopback address at the derived port, so this
+# still validates the cert chain the public depends on rather than skipping verification with `-k`.
+# A verify step is the right place to catch an expired or misissued cert (#2037 took the tier down
+# ~21h). `curl -fsS` fails on any non-2xx or a refused connection, so a gateway that is genuinely
+# down aborts this step under `set -e` — the health assertion below is load-bearing, not cosmetic.
+GATEWAY="https://node-rpc.dig.net:$GATEWAY_PORT"
+RESOLVE=(--resolve "node-rpc.dig.net:$GATEWAY_PORT:127.0.0.1")
 curl -fsS --max-time 5 "${RESOLVE[@]}" "$GATEWAY/health"
 echo
 
@@ -113,15 +123,16 @@ echo "--- nothing else is listening on a routable address ---"
 # every non-loopback listener and assert the set is exactly what this service intends.
 UNEXPECTED="$(ss -tlnH 2>/dev/null | awk '{print $4}' \
   | grep -vE '^(127\.0\.0\.1|\[::1\]):' \
-  | grep -vE ':(9444|9445|443)$' || true)"
+  | grep -vE ":(9444|9445|$GATEWAY_PORT)\$" || true)"
 if [ -n "$UNEXPECTED" ]; then
   echo "FAIL: unexpected listener(s) on a routable address:" >&2
   echo "$UNEXPECTED" >&2
   exit 1
 fi
-# 443 replaces 8080 here for the same reason as above. Note this assertion was NOT protecting
-# anything while it named 8080: the step aborted at the /health probe several checks earlier, so
-# the boundary check never ran on any deploy since the TLS cutover.
-echo "routable listeners are exactly 9444, 9445, 443"
+# The gateway port here is the same DERIVED value used for the /health probe above — one source of
+# truth, so this boundary assertion can never again disagree with the port the gateway actually
+# binds. Note it was NOT protecting anything while it named a stale literal: the step aborted at the
+# /health probe several checks earlier, so the boundary check never ran on a post-cutover deploy.
+echo "routable listeners are exactly 9444, 9445, $GATEWAY_PORT"
 
 echo "VERIFIED"

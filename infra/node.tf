@@ -100,7 +100,15 @@ resource "aws_instance" "node" {
     delete_on_termination = true
   }
 
-  user_data_replace_on_change = true
+  # A routine deploy MUST NOT recycle this box. The gateway binary's SHA changes on every build —
+  # even a rebuild of identical source is not bit-reproducible — and that SHA is templated into
+  # user_data. With replacement on a user_data change, every deploy TerminateInstances +
+  # RunInstances'd the node: ~2.5 min of public outage, a `dnf -y update` against an unpinned input,
+  # and the certificate-restore path that took the tier down for ~21h when it fell through to a new
+  # issuance (dig_ecosystem#2034 / #2037). The new binary is applied IN PLACE instead — deploy.yml
+  # installs the freshly-built, checksum-verified gateway over SSM (.github/update-gateway.sh) and
+  # restarts the unit, the same in-place mechanism the nightly node update already uses.
+  user_data_replace_on_change = false
 
   # COMPRESSED, and not as an optimisation. EC2 caps user data at 16 KiB and the bootstrap renders
   # to ~24 KiB, so an uncompressed apply is rejected outright — with the entire script quoted back
@@ -112,7 +120,15 @@ resource "aws_instance" "node" {
   lifecycle {
     # The AMI parameter moves whenever AL2023 publishes; that alone should not recycle a serving
     # node. Replace deliberately, by tainting, not as a side effect of an unrelated apply.
-    ignore_changes = [ami]
+    #
+    # `user_data_base64` is ignored for the same reason `user_data_replace_on_change` is false:
+    # a per-build SHA change must not disturb the running instance AT ALL — not a replacement and
+    # not the stop/start an in-place ModifyInstanceAttribute would incur. user_data remains the
+    # checksum-pinned bootstrap floor a FRESH instance installs (its value at create time); the
+    # running host is kept current out-of-band by deploy.yml's in-place install, which also
+    # reconciles a freshly-replaced instance. A deliberate `terraform taint` should therefore be
+    # followed by a deploy (runbooks/deploy.md) so the floor and the running gateway reconverge.
+    ignore_changes = [ami, user_data_base64]
 
     precondition {
       condition     = length(local.bootstrap_encoded) <= local.bootstrap_encoded_limit
@@ -159,12 +175,13 @@ resource "aws_eip" "node" {
 # Capsules are NOT here. They are on the S3 mount; this volume is small on purpose.
 # The AZ comes from the SUBNET, not from `aws_instance.node.availability_zone`.
 #
-# That distinction is the whole reason this volume works. Every release changes the gateway
-# binary's SHA, which changes `user_data`, which replaces the instance — that is the intended
-# immutable-deploy behaviour. But reading the AZ off the instance makes it "known after apply" the
-# moment a replace is planned, which forces the VOLUME to be replaced too, which `prevent_destroy`
-# then blocks: a deploy that cannot proceed and a peer identity one `-target` away from being
-# deleted. Pinning to the subnet keeps the volume completely still while instances come and go.
+# That distinction is the whole reason this volume works. A routine deploy no longer replaces the
+# instance (see the instance's lifecycle above), but a DELIBERATE replacement — a `terraform taint`
+# or an AMI refresh — still can, and the volume must survive it. Reading the AZ off the instance
+# makes it "known after apply" the moment a replace is planned, which forces the VOLUME to be
+# replaced too, which `prevent_destroy` then blocks: a deploy that cannot proceed and a peer
+# identity one `-target` away from being deleted. Pinning to the subnet keeps the volume completely
+# still while instances come and go.
 resource "aws_ebs_volume" "state" {
   availability_zone = data.aws_subnet.candidate[local.subnet_id].availability_zone
   size              = 8
