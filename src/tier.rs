@@ -22,6 +22,10 @@ pub enum Tier {
 
 /// Every method the anonymous public read tier may call, verbatim.
 ///
+/// Note: the path-addressed content read (`GET /stores/:id/content/:rk`, #2000) is a SEPARATE,
+/// hardcoded read surface — it always issues exactly `dig.getContent` and is not governed by this
+/// allowlist. This slice governs only the `POST /` JSON-RPC tier gate.
+///
 /// Sourced from the read-tier catalogue in `DESIGN_DIG_RPC.md` §1 plus the tier ruling in §2.5
 /// (the chain-anchored reads are canonically PUBLIC-READ: they are facts a browser resolves
 /// anonymously). Matching is **exact and case-sensitive** — see [`tier_of`].

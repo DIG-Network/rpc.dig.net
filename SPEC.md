@@ -87,6 +87,106 @@ Requirements:
 
 ---
 
+## 3a. The path-addressed content read (normative)
+
+CloudFront routes `GET /stores/{store_id}/content/{rk}` to the gateway so a browser (the hub's
+service worker) can fetch immutable ciphertext by URL rather than by JSON-RPC. This is a
+**read-only translation**, not a proxy and not a new tier: the gateway accepts exactly this one
+path shape and issues only `dig.getContent` calls (paging the resource's windows). Writes and
+§21.9-authenticated reads are
+**NOT** on this surface — admitting either would violate the boundary invariant (§2, this document
+line 46) and the header-stripping rule (§3.3). Only the anonymous content read lives here.
+
+### 3a.1 Request
+
+| element | requirement |
+|---|---|
+| `store_id` (path) | MUST be 64-hex (a 32-byte store id) |
+| `rk` (path) | MUST be 64-hex (a 32-byte retrieval key) |
+| `root` (query) | REQUIRED, MUST be 64-hex — the chain-anchored root the caller pins |
+| `Range` header / `?range=` | OPTIONAL single explicit-start byte range (`bytes=start-end` or `bytes=start-`) |
+
+A malformed or missing `store_id`, `rk`, or `root` MUST be answered `400` with
+`Cache-Control: no-store`. An error MUST NEVER be returned with the immutable cache directive.
+
+### 3a.2 Translation, streaming, and bounds
+
+The gateway MUST issue `dig.getContent` to the node over loopback, following `next_offset` until the
+requested span is covered, decoding the base64 `ciphertext` and capturing `inclusion_proof` +
+`chunk_lens` from the offset-0 window. It MUST forward NO inbound `Authorization`, cookie, or
+client-identity header on the loopback call (§3.3) — only the JSON-RPC body crosses.
+
+The response body MUST be **streamed**, not assembled: the gateway fetches the first window (for the
+headers, and so an upstream failure is detectable while the status is still mutable), then streams
+each subsequent window's bytes as they arrive, holding only ~one window in memory at a time. It MUST
+NOT buffer the whole resource. Because memory is bounded by streaming, the gateway MUST NOT impose a
+resource-size cap and MUST NOT return `413` (or any size-dependent status) on the content path: a
+size-dependent status is a **holdings oracle** — a held resource above a cap would answer differently
+from a not-held key's small decoy, revealing that the key is held. Every content read is `200`.
+
+The fetch MUST be **range-scoped**: for a `Range` request the gateway MUST stream only the windows
+overlapping `[start, end]` (paging from the covering window of `start`, slicing the tail window to
+`end`), never windows outside the span. The gateway MUST enforce a maximum window-iteration count and
+MUST require strict forward progress (a non-advancing `next_offset` MUST terminate the stream) — an
+anti-spin bound only; it MUST NOT change the committed `200` status.
+
+**An abnormal termination of an INCOMPLETE resource MUST abort the body, never end it cleanly.** The
+status is committed to `200` before the body streams and cannot be rewritten, but a clean chunked EOF
+tells CloudFront the (immutable) response is COMPLETE — it would then cache a TRUNCATED ciphertext for
+a year, permanently breaking that content URL (the reader's AEAD tag fails on the short bytes).
+Therefore a mid-stream upstream failure, a non-advancing node, or the window-budget trip on a resource
+that is not yet `complete` MUST terminate the body with a transfer ERROR (an aborted stream), so a CDN
+or client treats the response as incomplete and REFUSES to cache it. The body MAY end cleanly ONLY on
+genuine completion (the node's `complete`) or once a bounded range has been fully delivered.
+
+### 3a.3 Response
+
+A served read MUST return `200` with:
+
+| header | value |
+|---|---|
+| body | the raw ciphertext bytes for the requested span (NOT JSON), streamed |
+| `Content-Type` | `application/octet-stream` |
+| `Content-Length` | the exact streamed byte count, when the offset-0 window was fetched (see below) |
+| `Cache-Control` | `public, max-age=31536000, immutable` |
+| `Access-Control-Allow-Origin` | `*` |
+| `Access-Control-Expose-Headers` | `x-dig-inclusion-proof, x-dig-chunk-lens, x-dig-total-length` |
+| `X-Dig-Total-Length` | full-resource CIPHERTEXT byte count = sum(`chunk_lens`), when the offset-0 window was fetched |
+| `X-Dig-Inclusion-Proof` | the inclusion proof (base64), when present |
+| `X-Dig-Chunk-Lens` | the per-chunk lengths, comma-joined decimals, ONLY for a multi-chunk resource |
+
+`chunk_lens` are CIPHERTEXT byte lengths, so `sum(chunk_lens)` is the total ciphertext byte count
+(the value carried by `X-Dig-Total-Length`). When the gateway fetched the offset-0 window it knows the
+exact byte count it will stream, and it MUST set `Content-Length` accordingly — the whole-resource
+total for a whole read, or the clamped range size for a range that starts at 0. This is a second,
+independent defence against a truncated body being cached (a short body also fails the declared
+length). A **mid-range** read (`start > 0`) never fetches offset 0, so it has no `chunk_lens`; the
+gateway MUST omit `Content-Length` for that case only.
+
+The gateway MUST NOT set `X-Dig-Root`, `ETag`, `Accept-Ranges`, or `Content-Range` — the URL is
+already content-addressed and the immutable cache-control carries permanence. The
+`Access-Control-Expose-Headers` list is REQUIRED: without it a cross-origin browser cannot read the
+`X-Dig-*` headers.
+
+**Range semantics are full-`200` slice, never `206`/`416`.** A `Range` request MUST return `200`
+with the sliced bytes; a start at or beyond the resource end MUST return `200` with an empty body.
+The gateway MUST NOT return `206`, `416`, `Content-Range`, or `Accept-Ranges`: a `206`-vs-`416`
+distinction leaks whether the resource is large enough to satisfy the range, a key-existence oracle,
+and a `416` carrying the immutable directive is additionally a cache-poisoning vector.
+
+### 3a.4 The decoy rule (MUST)
+
+A missing or unauthorized key — **including** an upstream `-32004` `RESOURCE_UNAVAILABLE` — MUST be
+answered `200` with the node's constant-time decoy ciphertext, and **MUST NEVER** be answered `404`.
+The node emits the decoy; the gateway relays it and MUST NOT synthesize its own. The gateway MUST
+NOT introduce any status, length, header-set, or timing divergence between a real hit and a decoy —
+any such divergence is a key-existence oracle. Accordingly the gateway reads the node's `result`
+window whether or not a `-32004` error field accompanies it. A reply carrying no content window at
+all (a transport failure or a bare error) MUST be `502` with `Cache-Control: no-store` — never
+`404`.
+
+---
+
 ## 4. The tier gate (normative)
 
 A `POST /` body reaches the node only if **every** JSON-RPC call it contains names a method on the
@@ -357,3 +457,17 @@ An implementation conforms when:
    the host installs nothing and leaves the node serving.
 10. A release that installs but does not serve is rolled back, and the deployment's recorded
     version still names the release that is actually running.
+11. `GET /stores/{store_id}/content/{rk}?root=…` (§3a) STREAMS the node's ciphertext as raw bytes
+    with the pinned header set (`Content-Type`, `Content-Length` = sum(`chunk_lens`) when the offset-0
+    window was fetched, immutable `Cache-Control`, `Access-Control-Allow-Origin: *`,
+    `Access-Control-Expose-Headers`, `X-Dig-Total-Length`, `X-Dig-Inclusion-Proof`, and
+    `X-Dig-Chunk-Lens` for a multi-chunk resource) and NO `X-Dig-Root`, `ETag`, `Accept-Ranges`, or
+    `Content-Range` (`Content-Length` is omitted only for a mid-range `start > 0` read); a malformed
+    address is `400 no-store`; EVERY served read is `200` — including a whole read larger than any
+    former cap and a missing/unauthorized key (incl. upstream `-32004`), which streams a `200` decoy,
+    never `404` and never a size-dependent `413`, with no status/length/header-set divergence from a
+    real hit; a byte range returns `200` with the sliced bytes (never `206`/`416`) and streams only the
+    overlapping windows; an abnormal termination of an incomplete resource ABORTS the body (transfer
+    error) so a truncated ciphertext is never cached as complete, while a genuinely complete resource
+    ends cleanly; an upstream failure with no window is `502 no-store`; memory is bounded to ~one window
+    by streaming (no size cap); and no inbound auth header reaches the node.
