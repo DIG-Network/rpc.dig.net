@@ -352,6 +352,13 @@ s3://<capsule bucket>/{store_hex}/{root_hex}.dig
 | gateway (`443`) | TCP | **CloudFront origin ranges only** | the gateway |
 | `9778` | TCP | **loopback only — never exposed** | dig-node local surface |
 
+The gateway's canonical production port is **`443`**, set once by `var.gateway_port` (default `443`)
+and threaded into the unit's `GATEWAY_LISTEN` (§7). Everything that needs the port derives it from
+there — the post-deploy verification reads it back off the running unit rather than keeping a second
+literal, because a hardcoded copy is exactly what drifted and reported every healthy deploy as failed
+(dig_ecosystem#2034). The `0.0.0.0:8080` in §7 is the code's DEV-only fallback for when
+`GATEWAY_LISTEN` is unset; it is never the deployed value.
+
 `9778` MUST NOT appear in any security group. STUN defaults off: an open UDP reflector is a
 reflection/amplification surface, and being a peer does not require being a STUN server.
 
@@ -364,7 +371,7 @@ exist for the peer host.
 
 | variable | default | meaning |
 |---|---|---|
-| `GATEWAY_LISTEN` | `0.0.0.0:8080` | gateway bind address |
+| `GATEWAY_LISTEN` | `0.0.0.0:8080` (dev only) | gateway bind address; the deploy sets `0.0.0.0:443` (§6) |
 | `DIG_NODE_URL` | `http://127.0.0.1:9778` | the wrapped node; MUST be loopback |
 | `GATEWAY_TLS_CERT` | — | PEM certificate chain served on the origin hop |
 | `GATEWAY_TLS_KEY` | — | PEM private key for that chain |
@@ -429,6 +436,19 @@ An update MUST:
 Nothing about this may introduce a second writer of the deployment (§7.1's certificate reasoning
 applies to the whole stack): exactly one mechanism applies infrastructure, and an update path that
 changes what runs on the host MUST be mutually exclusive with it.
+
+### 7.3 A routine deploy MUST NOT replace the serving host
+
+Advancing the gateway is a hot path: it happens on every release, in front of live readers. A routine
+deploy MUST NOT terminate and recreate the instance — a replacement incurs public downtime, re-runs an
+unpinned host update, and re-exercises the certificate-restore path whose failure took the tier down
+for ~21h (§7.1, dig_ecosystem#2034 / #2037). The infrastructure MUST leave the running instance
+undisturbed on a per-release binary change, and the new gateway binary MUST instead be applied **in
+place**: fetched, its SHA-256 verified against the published bytes **before** it is installed, proven
+loadable on the host's architecture, swapped, and the unit restarted — judged on the gateway serving
+over its real TLS origin, and **rolled back** to the previous binary if it does not. The deployed
+`user_data` remains the checksum-pinned bootstrap floor a *fresh* instance installs; a deliberate host
+replacement MUST be reconciled back to the latest release (a following deploy or an in-place install).
 
 ---
 

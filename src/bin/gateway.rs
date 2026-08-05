@@ -1,9 +1,13 @@
 //! The `rpc.dig.net` gateway process.
 //!
 //! Runs beside a real `dig-node` on the same host and publishes exactly one thing to the world:
-//! the anonymous public read tier. Listens on `GATEWAY_LISTEN` (default `0.0.0.0:8080`, behind
-//! CloudFront) and forwards screened JSON-RPC to the node's loopback surface at `DIG_NODE_URL`
-//! (default `http://127.0.0.1:9778`).
+//! the anonymous public read tier. Listens on `GATEWAY_LISTEN` and forwards screened JSON-RPC to
+//! the node's loopback surface at `DIG_NODE_URL` (default `http://127.0.0.1:9778`).
+//!
+//! `GATEWAY_LISTEN` defaults to `0.0.0.0:8080` ONLY as a dev convenience for when it is unset. The
+//! canonical production port is `443`: the deploy sets `GATEWAY_LISTEN=0.0.0.0:443` (from
+//! `var.gateway_port`) so the gateway terminates TLS on the port CloudFront reaches over HTTPS.
+//! That value lives in exactly one place — terraform — and everything else derives it (see SPEC §6).
 //!
 //! The route table and the tier gate live in the library (`rpc_dig_net::server`,
 //! `rpc_dig_net::gate`) so they can be tested; this file is only process wiring.
