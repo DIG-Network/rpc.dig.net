@@ -1576,7 +1576,8 @@ done
 
         let run = run.expect_success();
         assert!(
-            run.stderr().contains("does not resolve inside the state directory"),
+            run.stderr()
+                .contains("does not resolve inside the state directory"),
             "a symlink loop was not refused — the containment check failed OPEN:\n{}",
             run.stderr()
         );
