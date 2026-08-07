@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.4.2] - 2026-08-07
+
+### Bug Fixes
+- **cert:** Contain the sparse-member DoS in the origin-cert restore/peek path (#17)
+
 ## [0.4.1] - 2026-08-05
 
 ### Bug Fixes
