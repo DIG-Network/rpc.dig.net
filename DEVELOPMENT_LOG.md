@@ -189,3 +189,26 @@ if it fails to serve). `user_data` remains the checksum-pinned bootstrap floor a
 installs; a deliberate `terraform taint` must be followed by a deploy so the floor and the running
 gateway reconverge.
 
+## `ETXTBSY` when a test writes an executable and a SIBLING THREAD forks
+
+`tests/origin_cert.rs` reddened `ci` on roughly half of all runs with
+`make-cert: Os { code: 26, kind: ExecutableFileBusy }` — always at the same exec, never the same
+test. Each sandbox already wrote its own private copy of the helper into its own temp dir, so the
+usual explanation (two tests sharing one path) was not it.
+
+`fork` duplicates the whole descriptor table, regardless of which thread called it. While one test
+thread has its helper open for writing, any OTHER test thread that spawns a process hands that WRITE
+descriptor to the child, and the kernel refuses to `execve` a file that is open for writing until
+that child reaches its own `exec`. So the two racing parties are unrelated tests touching unrelated
+files: what leaks is the descriptor, not the path. Uniquely naming the file, or building it once up
+front, cannot close that window; `O_CLOEXEC` cannot either, because close-on-exec runs only after
+the kernel has already decided `ETXTBSY`.
+
+The fix is a process-wide `RwLock` used the other way round from the obvious one: writers of an
+executable take the EXCLUSIVE side, every process spawn takes the SHARED side. No `fork` can then
+observe a half-written executable, and spawns still run fully in parallel with each other. The guard
+covers only the fork itself — children are waited for after it is released — so a slow helper never
+blocks another test from installing its fakes.
+
+Measured: 15 failures in 30 runs at `--test-threads=64` before, 0 in 50 after.
+
