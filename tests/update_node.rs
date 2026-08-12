@@ -321,10 +321,9 @@ exit 0
         }
 
         fn installed_version(&self) -> String {
-            let out = spawn_output(
-                Command::new(self.path("usrbin").join("dig-node")).arg("--version"),
-            )
-            .expect("query the installed binary");
+            let out =
+                spawn_output(Command::new(self.path("usrbin").join("dig-node")).arg("--version"))
+                    .expect("query the installed binary");
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
 

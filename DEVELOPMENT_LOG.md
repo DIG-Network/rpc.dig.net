@@ -206,9 +206,14 @@ the kernel has already decided `ETXTBSY`.
 
 The fix is a process-wide `RwLock` used the other way round from the obvious one: writers of an
 executable take the EXCLUSIVE side, every process spawn takes the SHARED side. No `fork` can then
-observe a half-written executable, and spawns still run fully in parallel with each other. The guard
-covers only the fork itself — children are waited for after it is released — so a slow helper never
-blocks another test from installing its fakes.
+observe a half-written executable, and spawns still run fully in parallel with each other. The shared guard is held until `Command::spawn` returns; on Linux, `spawn` blocks until the child
+has exec'd (it waits on the CLOEXEC status pipe), so the guarded window is **fork-through-exec** —
+the entire interval in which an inherited write descriptor can yield `ETXTBSY`. Children are waited
+for *after* the guard is released, so a slow helper never blocks another test from installing its
+fakes. Releasing the guard right after the fork (or using a spawn path that returns before exec)
+would silently restore the ~50% failure rate. The same guard is applied in all three suites that
+write fake executables: `tests/origin_cert.rs`, `tests/update_node.rs`, and
+`tests/update_gateway.rs`, since the race is intra-binary and was present in each.
 
 Measured: 15 failures in 30 runs at `--test-threads=64` before, 0 in 50 after.
 
