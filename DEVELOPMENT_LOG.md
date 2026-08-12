@@ -188,3 +188,4 @@ installs the freshly-built, checksum-verified gateway over SSM (`update-gateway.
 if it fails to serve). `user_data` remains the checksum-pinned bootstrap floor a FRESH instance
 installs; a deliberate `terraform taint` must be followed by a deploy so the floor and the running
 gateway reconverge.
+
