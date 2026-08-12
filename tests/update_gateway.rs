@@ -90,8 +90,10 @@ fn the_health_probe_port_is_derived_from_the_unit() {
 mod behaviour {
     use super::*;
     use std::fs;
+    use std::io;
     use std::os::unix::fs::PermissionsExt;
-    use std::process::{Command, Output};
+    use std::process::{Child, Command, Output, Stdio};
+    use std::sync::RwLock;
 
     struct Sandbox {
         _dir: tempfile::TempDir,
@@ -121,6 +123,33 @@ mod behaviour {
     const BROKEN_SERVING: &str = "ELFAARCH64\nBROKEN gateway\n";
     const NOT_AN_EXECUTABLE: &str = "just some bytes, no ELF marker\n";
 
+    /// Keeps "a helper executable is open for writing" from overlapping "this process forks".
+    ///
+    /// Writers take the exclusive side; every spawn takes the shared side. The shared guard is
+    /// held until [`Command::spawn`] returns — on Linux `spawn` blocks until the child has exec'd
+    /// (via the CLOEXEC status pipe), so the guarded window is fork-through-exec, the entire
+    /// interval during which an inherited write descriptor can produce `ETXTBSY`. Children are
+    /// waited for after the guard is released, so a slow helper never blocks another test from
+    /// installing its fakes.
+    static NO_FORK_WHILE_WRITING: RwLock<()> = RwLock::new(());
+
+    /// Start `command`. Use this rather than [`Command::spawn`] — see [`NO_FORK_WHILE_WRITING`].
+    fn spawn_child(command: &mut Command) -> io::Result<Child> {
+        let _no_writes = NO_FORK_WHILE_WRITING
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        command.spawn()
+    }
+
+    /// Run `command` to completion, capturing its output. Replaces [`Command::output`].
+    fn spawn_output(command: &mut Command) -> io::Result<Output> {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        spawn_child(command)?.wait_with_output()
+    }
+
     impl Sandbox {
         /// A host currently serving on `installed` bytes.
         fn new(installed: &str) -> Sandbox {
@@ -145,6 +174,9 @@ mod behaviour {
         }
 
         fn write_executable(&self, path: &Path, body: &str) {
+            let _no_forks = NO_FORK_WHILE_WRITING
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             fs::write(path, body).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
@@ -246,28 +278,26 @@ fi
                 self.path("bin").display(),
                 std::env::var("PATH").unwrap_or_default()
             );
-            let output = Command::new("bash")
-                .arg(&script)
-                .env("PATH", path)
-                .env("SANDBOX", &self.root)
-                .env("NEW_URL", format!("https://example.invalid/{url_name}"))
-                .env("NEW_SHA", sha)
-                .env("GATEWAY_UPDATE_BIN_DIR", self.path("usrbin"))
-                .env("GATEWAY_UPDATE_CERT_ENV", self.path("no-such-env-file"))
-                .env("GATEWAY_UPDATE_OWNER", current_owner())
-                .env("GATEWAY_UPDATE_UNIT_TIMEOUT", "6")
-                .env("GATEWAY_UPDATE_HEALTH_TIMEOUT", "6")
-                .output()
-                .unwrap_or_else(|e| panic!("running {}: {e}", script.display()));
+            let output = spawn_output(
+                Command::new("bash")
+                    .arg(&script)
+                    .env("PATH", path)
+                    .env("SANDBOX", &self.root)
+                    .env("NEW_URL", format!("https://example.invalid/{url_name}"))
+                    .env("NEW_SHA", sha)
+                    .env("GATEWAY_UPDATE_BIN_DIR", self.path("usrbin"))
+                    .env("GATEWAY_UPDATE_CERT_ENV", self.path("no-such-env-file"))
+                    .env("GATEWAY_UPDATE_OWNER", current_owner())
+                    .env("GATEWAY_UPDATE_UNIT_TIMEOUT", "6")
+                    .env("GATEWAY_UPDATE_HEALTH_TIMEOUT", "6"),
+            )
+            .unwrap_or_else(|e| panic!("running {}: {e}", script.display()));
             Run { output }
         }
     }
 
     fn sha256_of(path: &Path) -> String {
-        let out = Command::new("sha256sum")
-            .arg(path)
-            .output()
-            .expect("sha256sum");
+        let out = spawn_output(Command::new("sha256sum").arg(path)).expect("sha256sum");
         String::from_utf8_lossy(&out.stdout)
             .split_whitespace()
             .next()
@@ -277,7 +307,7 @@ fi
 
     fn current_owner() -> String {
         let name = |flag: &str| {
-            let out = Command::new("id").arg(flag).output().expect("id");
+            let out = spawn_output(Command::new("id").arg(flag)).expect("id");
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         format!("{}:{}", name("-un"), name("-gn"))

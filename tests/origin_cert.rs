@@ -148,13 +148,20 @@ mod behaviour {
     ///
     /// So writers take the exclusive side and every spawn takes the shared side: no `fork` can
     /// observe a half-written executable, while spawns still run fully in parallel with each
-    /// other. Only the fork itself is covered — a child is waited for after the guard is
-    /// released, so a long-running helper never blocks another test from writing its fakes.
+    /// other. The shared guard is held until [`Command::spawn`] returns; on Linux `spawn` blocks
+    /// until the child has exec'd (or failed to) — it waits on the CLOEXEC status pipe — so the
+    /// guarded window is fork-through-exec, which is the entire interval during which an inherited
+    /// write descriptor can produce `ETXTBSY`. A "simplification" that releases the guard
+    /// immediately after the fork, or that uses a spawn path returning before exec, would silently
+    /// reintroduce the race. Children are waited for *after* the guard is released, so a
+    /// long-running helper never blocks another test from writing its fakes.
     static NO_FORK_WHILE_WRITING: RwLock<()> = RwLock::new(());
 
     /// Start `command`. Use this rather than [`Command::spawn`] — see [`NO_FORK_WHILE_WRITING`].
     fn spawn_child(command: &mut Command) -> io::Result<Child> {
-        let _no_writes = NO_FORK_WHILE_WRITING.read().expect("spawn guard");
+        let _no_writes = NO_FORK_WHILE_WRITING
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         command.spawn()
     }
 
@@ -232,7 +239,9 @@ mod behaviour {
 
         fn write_executable(&self, name: &str, body: &str) {
             let path = self.path("bin").join(name);
-            let _no_forks = NO_FORK_WHILE_WRITING.write().expect("write guard");
+            let _no_forks = NO_FORK_WHILE_WRITING
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             fs::write(&path, body).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
