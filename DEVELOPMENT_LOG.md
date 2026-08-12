@@ -188,3 +188,32 @@ installs the freshly-built, checksum-verified gateway over SSM (`update-gateway.
 if it fails to serve). `user_data` remains the checksum-pinned bootstrap floor a FRESH instance
 installs; a deliberate `terraform taint` must be followed by a deploy so the floor and the running
 gateway reconverge.
+
+## `ETXTBSY` when a test writes an executable and a SIBLING THREAD forks
+
+`tests/origin_cert.rs` reddened `ci` on roughly half of all runs with
+`make-cert: Os { code: 26, kind: ExecutableFileBusy }` — always at the same exec, never the same
+test. Each sandbox already wrote its own private copy of the helper into its own temp dir, so the
+usual explanation (two tests sharing one path) was not it.
+
+`fork` duplicates the whole descriptor table, regardless of which thread called it. While one test
+thread has its helper open for writing, any OTHER test thread that spawns a process hands that WRITE
+descriptor to the child, and the kernel refuses to `execve` a file that is open for writing until
+that child reaches its own `exec`. So the two racing parties are unrelated tests touching unrelated
+files: what leaks is the descriptor, not the path. Uniquely naming the file, or building it once up
+front, cannot close that window; `O_CLOEXEC` cannot either, because close-on-exec runs only after
+the kernel has already decided `ETXTBSY`.
+
+The fix is a process-wide `RwLock` used the other way round from the obvious one: writers of an
+executable take the EXCLUSIVE side, every process spawn takes the SHARED side. No `fork` can then
+observe a half-written executable, and spawns still run fully in parallel with each other. The shared guard is held until `Command::spawn` returns; on Linux, `spawn` blocks until the child
+has exec'd (it waits on the CLOEXEC status pipe), so the guarded window is **fork-through-exec** —
+the entire interval in which an inherited write descriptor can yield `ETXTBSY`. Children are waited
+for *after* the guard is released, so a slow helper never blocks another test from installing its
+fakes. Releasing the guard right after the fork (or using a spawn path that returns before exec)
+would silently restore the ~50% failure rate. The same guard is applied in all three suites that
+write fake executables: `tests/origin_cert.rs`, `tests/update_node.rs`, and
+`tests/update_gateway.rs`, since the race is intra-binary and was present in each.
+
+Measured: 15 failures in 30 runs at `--test-threads=64` before, 0 in 50 after.
+

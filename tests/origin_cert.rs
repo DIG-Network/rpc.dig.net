@@ -126,12 +126,58 @@ fn the_renewal_timer_runs_through_the_helper_so_renewals_are_published() {
 mod behaviour {
     use super::*;
     use std::fs;
+    use std::io;
     use std::os::unix::fs::PermissionsExt;
-    use std::process::{Command, Output};
+    use std::process::{Child, Command, ExitStatus, Output, Stdio};
+    use std::sync::RwLock;
 
     const HOST: &str = "node-rpc.dig.net";
     const SAN: &str = "rpc-origin.dig.net";
     const SECRET: &str = "rpc.dig.net/origin-cert";
+
+    /// Keeps "a helper executable is open for writing" from overlapping "this process forks".
+    ///
+    /// Every fake in this suite is written by the test process and then executed by it, and on
+    /// Linux those two acts race across THREADS even though each sandbox writes its own private
+    /// copy of the file. `fork` duplicates the entire descriptor table, so a sibling test that
+    /// spawns anything while [`Sandbox::write_executable`] still holds its file open hands that
+    /// WRITE descriptor to the child; until the child reaches `execve` the kernel still counts the
+    /// file as open for writing and refuses to execute it — `ETXTBSY`, "Text file busy". Giving
+    /// each test a uniquely named copy of the helper cannot fix this, because what leaks is the
+    /// descriptor, not the path.
+    ///
+    /// So writers take the exclusive side and every spawn takes the shared side: no `fork` can
+    /// observe a half-written executable, while spawns still run fully in parallel with each
+    /// other. The shared guard is held until [`Command::spawn`] returns; on Linux `spawn` blocks
+    /// until the child has exec'd (or failed to) — it waits on the CLOEXEC status pipe — so the
+    /// guarded window is fork-through-exec, which is the entire interval during which an inherited
+    /// write descriptor can produce `ETXTBSY`. A "simplification" that releases the guard
+    /// immediately after the fork, or that uses a spawn path returning before exec, would silently
+    /// reintroduce the race. Children are waited for *after* the guard is released, so a
+    /// long-running helper never blocks another test from writing its fakes.
+    static NO_FORK_WHILE_WRITING: RwLock<()> = RwLock::new(());
+
+    /// Start `command`. Use this rather than [`Command::spawn`] — see [`NO_FORK_WHILE_WRITING`].
+    fn spawn_child(command: &mut Command) -> io::Result<Child> {
+        let _no_writes = NO_FORK_WHILE_WRITING
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        command.spawn()
+    }
+
+    /// Run `command` to completion, capturing its output. Replaces [`Command::output`].
+    fn spawn_output(command: &mut Command) -> io::Result<Output> {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        spawn_child(command)?.wait_with_output()
+    }
+
+    /// Run `command` to completion, letting it inherit our streams. Replaces [`Command::status`].
+    fn spawn_status(command: &mut Command) -> io::Result<ExitStatus> {
+        spawn_child(command)?.wait()
+    }
 
     /// The test user's own primary group — one it can `chgrp` to without being root.
     fn current_group() -> String {
@@ -151,7 +197,7 @@ mod behaviour {
     }
 
     fn id_field(flag: &str) -> String {
-        let out = Command::new("id").arg(flag).output().expect("id");
+        let out = spawn_output(Command::new("id").arg(flag)).expect("id");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -193,6 +239,9 @@ mod behaviour {
 
         fn write_executable(&self, name: &str, body: &str) {
             let path = self.path("bin").join(name);
+            let _no_forks = NO_FORK_WHILE_WRITING
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             fs::write(&path, body).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
@@ -310,11 +359,12 @@ done
         /// Put a certificate valid for `days` into the state directory.
         fn given_a_certificate_on_disk(&self, days: u32) {
             self.install_cert_writer();
-            let status = Command::new(self.path("bin").join("make-cert"))
-                .arg(days.to_string())
-                .env("SANDBOX", &self.root)
-                .status()
-                .expect("make-cert");
+            let status = spawn_status(
+                Command::new(self.path("bin").join("make-cert"))
+                    .arg(days.to_string())
+                    .env("SANDBOX", &self.root),
+            )
+            .expect("make-cert");
             assert!(status.success(), "could not build the test certificate");
         }
 
@@ -345,15 +395,12 @@ done
                 fs::write(&target, body).unwrap();
             }
 
-            let packed = Command::new("bash")
-                .arg("-c")
-                .arg(format!(
-                    "tar -czf - -C '{}' . | base64 -w0 > '{}'",
-                    hostile.display(),
-                    self.stored_secret().display()
-                ))
-                .status()
-                .expect("packing the archive");
+            let packed = spawn_status(Command::new("bash").arg("-c").arg(format!(
+                "tar -czf - -C '{}' . | base64 -w0 > '{}'",
+                hostile.display(),
+                self.stored_secret().display()
+            )))
+            .expect("packing the archive");
             assert!(packed.success(), "could not build the test archive");
         }
 
@@ -374,10 +421,7 @@ done
                 build,
                 self.stored_secret().display()
             );
-            let status = Command::new("bash")
-                .arg("-c")
-                .arg(&script)
-                .status()
+            let status = spawn_status(Command::new("bash").arg("-c").arg(&script))
                 .expect("packing the hostile peek archive");
             assert!(status.success(), "could not build the hostile peek archive");
         }
@@ -428,8 +472,7 @@ done
             for (key, value) in extra {
                 command.env(key, value);
             }
-            let output = command
-                .output()
+            let output = spawn_output(&mut command)
                 .unwrap_or_else(|e| panic!("running {}: {e}", script.display()));
             Run {
                 subcommand: subcommand.to_string(),
@@ -841,17 +884,14 @@ done
         }
         let victim = sandbox.path("victim");
         fs::create_dir_all(&victim).unwrap();
-        let packed = Command::new("bash")
-            .arg("-c")
-            .arg(format!(
-                "ln -s '{}' '{}/archive' && tar -czf - -C '{}' . | base64 -w0 > '{}'",
-                victim.display(),
-                escapee.display(),
-                escapee.display(),
-                sandbox.stored_secret().display()
-            ))
-            .status()
-            .expect("packing the escaping archive");
+        let packed = spawn_status(Command::new("bash").arg("-c").arg(format!(
+            "ln -s '{}' '{}/archive' && tar -czf - -C '{}' . | base64 -w0 > '{}'",
+            victim.display(),
+            escapee.display(),
+            escapee.display(),
+            sandbox.stored_secret().display()
+        )))
+        .expect("packing the escaping archive");
         assert!(packed.success(), "could not build the test archive");
         let before = sandbox
             .certificate_on_disk()
@@ -1051,15 +1091,12 @@ done
             )
             .unwrap();
         }
-        let packed = Command::new("bash")
-            .arg("-c")
-            .arg(format!(
-                "mkfifo '{0}/live/pipe' && tar -czf - -C '{0}' . | base64 -w0 > '{1}'",
-                staged.display(),
-                sandbox.stored_secret().display()
-            ))
-            .status()
-            .expect("packing an archive with a fifo");
+        let packed = spawn_status(Command::new("bash").arg("-c").arg(format!(
+            "mkfifo '{0}/live/pipe' && tar -czf - -C '{0}' . | base64 -w0 > '{1}'",
+            staged.display(),
+            sandbox.stored_secret().display()
+        )))
+        .expect("packing an archive with a fifo");
         assert!(packed.success(), "could not build the test archive");
         let before = sandbox
             .certificate_on_disk()
@@ -1094,27 +1131,25 @@ done
             )
             .unwrap();
         }
-        let packed = Command::new("bash")
-            .arg("-c")
-            .arg(format!(
-                "printf '#!/bin/sh\\n' > '{0}/live/rooted' && chmod 4755 '{0}/live/rooted' && \
+        let packed = spawn_status(Command::new("bash").arg("-c").arg(format!(
+            "printf '#!/bin/sh\\n' > '{0}/live/rooted' && chmod 4755 '{0}/live/rooted' && \
                  tar -czf - -C '{0}' . | base64 -w0 > '{1}'",
-                staged.display(),
-                sandbox.stored_secret().display()
-            ))
-            .status()
-            .expect("packing an archive with a setuid file");
+            staged.display(),
+            sandbox.stored_secret().display()
+        )))
+        .expect("packing an archive with a setuid file");
         assert!(packed.success(), "could not build the test archive");
 
         // Either outcome is acceptable — refused, or installed with the bits gone. What is not
         // acceptable is a setuid file sitting in the state directory afterwards.
         let _ = sandbox.run("restore");
 
-        let survivors = Command::new("find")
-            .arg(sandbox.state_dir())
-            .args(["-perm", "/6000"])
-            .output()
-            .expect("find");
+        let survivors = spawn_output(
+            Command::new("find")
+                .arg(sandbox.state_dir())
+                .args(["-perm", "/6000"]),
+        )
+        .expect("find");
         let survivors = String::from_utf8_lossy(&survivors.stdout);
         assert!(
             survivors.trim().is_empty(),
@@ -1168,14 +1203,11 @@ done
         sandbox.given_a_certificate_on_disk(90);
         let live = sandbox.state_dir().join("live").join(HOST);
         let stolen = sandbox.path("other-key.pem");
-        Command::new("bash")
-            .arg("-c")
-            .arg(format!(
-                "openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out '{}' 2>/dev/null",
-                stolen.display()
-            ))
-            .status()
-            .expect("generating an unrelated key");
+        spawn_status(Command::new("bash").arg("-c").arg(format!(
+            "openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out '{}' 2>/dev/null",
+            stolen.display()
+        )))
+        .expect("generating an unrelated key");
         fs::copy(&stolen, live.join("privkey.pem")).unwrap();
 
         sandbox.run("check").expect_failure();
@@ -1193,14 +1225,11 @@ done
 
         sandbox.run("save").expect_success();
 
-        let listing = Command::new("bash")
-            .arg("-c")
-            .arg(format!(
-                "base64 -d < '{}' | tar -tzf -",
-                sandbox.stored_secret().display()
-            ))
-            .output()
-            .expect("listing the published archive");
+        let listing = spawn_output(Command::new("bash").arg("-c").arg(format!(
+            "base64 -d < '{}' | tar -tzf -",
+            sandbox.stored_secret().display()
+        )))
+        .expect("listing the published archive");
         let listing = String::from_utf8_lossy(&listing.stdout);
         assert!(
             !listing.contains("renewal-hooks"),
@@ -1218,11 +1247,12 @@ done
     fn a_stored_archive_without_this_hosts_certificate_is_refused() {
         let sandbox = Sandbox::new();
         sandbox.given_a_certificate_on_disk(90);
-        let empty_archive = Command::new("bash")
-            .arg("-c")
-            .arg("tar -czf - -T /dev/null | base64 -w0")
-            .output()
-            .expect("building an empty archive");
+        let empty_archive = spawn_output(
+            Command::new("bash")
+                .arg("-c")
+                .arg("tar -czf - -T /dev/null | base64 -w0"),
+        )
+        .expect("building an empty archive");
         fs::write(sandbox.stored_secret(), empty_archive.stdout).unwrap();
 
         sandbox.run("restore").expect_failure();
@@ -1370,11 +1400,7 @@ done
         let path = dir.path().join("user_data.sh");
         fs::write(&path, &rendered).unwrap();
 
-        let check = Command::new("bash")
-            .arg("-n")
-            .arg(&path)
-            .output()
-            .expect("bash -n");
+        let check = spawn_output(Command::new("bash").arg("-n").arg(&path)).expect("bash -n");
         assert!(
             check.status.success(),
             "the rendered bootstrap is not valid bash:\n{}",
@@ -1397,18 +1423,19 @@ done
         let rendered = render_bootstrap();
 
         // Terraform's base64gzip uses Go's default compression level, which is gzip's own default.
-        let compressed = Command::new("bash")
-            .arg("-c")
-            .arg("gzip -c")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                child.stdin.take().unwrap().write_all(rendered.as_bytes())?;
-                child.wait_with_output()
-            })
-            .expect("gzip");
+        let compressed = spawn_child(
+            Command::new("bash")
+                .arg("-c")
+                .arg("gzip -c")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped()),
+        )
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(rendered.as_bytes())?;
+            child.wait_with_output()
+        })
+        .expect("gzip");
 
         let size = compressed.stdout.len();
         assert!(
