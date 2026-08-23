@@ -1657,6 +1657,53 @@ done
              (dig_ecosystem#2064): {offenders:?}"
         );
     }
+
+    /// Regression: the harness must never *execute* a program it has just written.
+    ///
+    /// CI run 31142395904 (the push of v0.4.2) failed here, and nowhere else:
+    ///
+    /// ```text
+    /// panicked at tests/origin_cert.rs:317:
+    ///   make-cert: Os { code: 26, kind: ExecutableFileBusy, message: "Text file busy" }
+    /// ```
+    ///
+    /// Nothing was wrong with the certificate logic. `given_a_certificate_on_disk` wrote
+    /// `bin/make-cert` and exec'd it on the next line, and Linux refuses to exec a file while any
+    /// process holds it open for writing. `cargo test` runs this file's tests on parallel threads,
+    /// and every `Command` spawn forks: between the fork and the exec, the child holds a copy of
+    /// every fd its parent had open — including another thread's still-open write handle on the
+    /// file being written. The window is a few microseconds wide, which is why this reproduced
+    /// once in months and why re-running would have "fixed" it.
+    ///
+    /// A racing reproduction would be a flaky test of a flaky test, so the race is made
+    /// deterministic instead: this test holds the write handle open itself, which is precisely the
+    /// condition the losing thread created by accident. Executing the file directly under that
+    /// condition ALWAYS returns `ETXTBSY`; reading it with an interpreter never can, because no
+    /// exec of the file occurs. Running the script through `bash` — the idiom every other script
+    /// invocation in this file already uses — is therefore not a retry or a widened timeout but a
+    /// removal of the failure mode.
+    #[test]
+    fn a_written_script_runs_even_while_a_write_handle_is_open() {
+        let sandbox = Sandbox::new();
+        sandbox.install_cert_writer();
+
+        // Exactly the state a concurrently-forked child puts the file in.
+        let held = fs::OpenOptions::new()
+            .write(true)
+            .open(sandbox.path("bin").join("make-cert"))
+            .expect("hold a write handle on the freshly written script");
+
+        sandbox.given_a_certificate_on_disk(90);
+
+        drop(held);
+        assert!(
+            sandbox
+                .path("state/live/node-rpc.dig.net")
+                .join("cert.pem")
+                .exists(),
+            "the certificate writer did not run"
+        );
+    }
 }
 
 /// `repo_root` is used by both halves of this file; keep it exercised when `cfg(unix)` is off.
