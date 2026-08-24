@@ -255,8 +255,8 @@ exit 0
 printf '%s\n' "$*" >>"$SANDBOX/certbot.log"
 [ -f "$SANDBOX/certbot-fails" ] && exit 1
 case "$1" in
-  certonly) "$SANDBOX/bin/make-cert" 90 ;;
-  renew)    [ -f "$SANDBOX/renewal-is-due" ] && "$SANDBOX/bin/make-cert" 90 ;;
+  certonly) bash "$SANDBOX/bin/make-cert" 90 ;;
+  renew)    [ -f "$SANDBOX/renewal-is-due" ] && bash "$SANDBOX/bin/make-cert" 90 ;;
 esac
 exit 0
 "#,
@@ -310,7 +310,13 @@ done
         /// Put a certificate valid for `days` into the state directory.
         fn given_a_certificate_on_disk(&self, days: u32) {
             self.install_cert_writer();
-            let status = Command::new(self.path("bin").join("make-cert"))
+            // Read the script with an interpreter rather than exec'ing the file we just wrote.
+            // Linux refuses to exec a file any process holds open for writing (ETXTBSY), and this
+            // harness runs on parallel threads whose `Command` spawns fork with the writing
+            // thread's descriptors still open. See
+            // `a_written_script_runs_even_while_a_write_handle_is_open`.
+            let status = Command::new("bash")
+                .arg(self.path("bin").join("make-cert"))
                 .arg(days.to_string())
                 .env("SANDBOX", &self.root)
                 .status()
