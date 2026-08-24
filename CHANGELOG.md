@@ -4,7 +4,12 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.4.2] - 2026-08-07
+## [0.4.3] - 2026-08-24
+
+### Bug Fixes
+- **test:** Run the written cert-writer through bash so it cannot hit ETXTBSY (#19)
+
+## [0.99.4] - 2026-08-07
 
 ### Bug Fixes
 - **cert:** Contain the sparse-member DoS in the origin-cert restore/peek path (#17)
